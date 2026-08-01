@@ -311,10 +311,27 @@ class HCHeadOp(CustomOp):
         hc_eps: float,
     ) -> torch.Tensor:
         if _is_sm8x():
-            # No native torch hc_head; use the portable triton path (as XPU does).
-            return self.forward_xpu(
-                hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
+            hc_mult, hidden_size = hidden_states.shape[-2:]
+            outer_shape = hidden_states.shape[:-2]
+            hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+            out = torch.empty(
+                hs_flat.shape[0],
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
+            torch.ops.vllm.hc_head_triton(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_norm_eps,
+                hc_eps,
+                hc_mult,
+            )
+            return out.view(*outer_shape, hidden_size)
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
