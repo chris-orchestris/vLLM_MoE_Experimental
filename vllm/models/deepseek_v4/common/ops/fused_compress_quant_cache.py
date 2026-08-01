@@ -29,6 +29,46 @@ from vllm.triton_utils import tl, triton
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
+@triton.jit
+def _fp32_to_fp8_e4m3fn_byte(x):
+    """Encode FP32 -> FP8 e4m3fn byte (uint8), saturating +/-448, RNE.
+
+    Used on SM8x where ``tl.float8e4nv`` casts are unsupported. e4m3fn:
+    1 sign | 4 exp (bias 7) | 3 mant; max 448 (S.1111.110); NaN never
+    generated (input is clamped to [-448, 448]).
+    """
+    bits = x.to(tl.int32, bitcast=True)
+    sign = ((bits >> 31) & 1).to(tl.int32)
+    abs_bits = bits & 0x7FFFFFFF
+    abs_bits = tl.minimum(abs_bits, 0x43E00000)  # saturate to 448
+    fp32_exp = (abs_bits >> 23) & 0xFF
+    fp32_mant = abs_bits & 0x7FFFFF
+    fp8_exp = fp32_exp.to(tl.int32) - 120  # (exp-127)+7
+    discard = fp32_mant & ((1 << 20) - 1)
+    half_threshold = 1 << 19
+    truncated = fp32_mant >> 20
+    round_up = (discard > half_threshold) | (
+        (discard == half_threshold) & ((truncated & 1) == 1)
+    )
+    rounded_mant = truncated + round_up.to(tl.int32)
+    overflow = rounded_mant == 8
+    rounded_mant = tl.where(overflow, tl.zeros_like(rounded_mant), rounded_mant)
+    fp8_exp_after = tl.minimum(fp8_exp + overflow.to(tl.int32), 15)
+    is_zero_input = fp32_exp == 0
+    is_normal = fp8_exp_after >= 1
+    is_subnormal = (fp8_exp_after >= -2) & (fp8_exp_after <= 0) & ~is_zero_input
+    fp_value = abs_bits.to(tl.float32, bitcast=True)
+    sub_mant = tl.minimum((fp_value * 512.0 + 0.5).to(tl.int32), 7)
+    out_normal = (fp8_exp_after << 3) | rounded_mant
+    out = tl.where(
+        is_normal,
+        out_normal,
+        tl.where(is_subnormal, sub_mant, tl.zeros_like(sub_mant)),
+    )
+    out = (sign << 7) | out
+    return out.to(tl.uint8)
+
+
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
     num_actual: int,
@@ -252,8 +292,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    # SM8x: byte-pack encode instead of the unsupported tl.float8e4nv cast.
+    x_uint8 = _fp32_to_fp8_e4m3fn_byte(x_clamped.to(tl.float32))
     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
@@ -818,8 +858,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    # SM8x: byte-pack encode instead of the unsupported tl.float8e4nv cast.
+    x_uint8 = _fp32_to_fp8_e4m3fn_byte(x_clamped.to(tl.float32))
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 

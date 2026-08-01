@@ -286,6 +286,59 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _fused_indexer_q_rope_quant_sm86_pyref(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+    fp8_max: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM8x reference for the FP8 path of fused_indexer_q_rope_quant.
+
+    Ampere (SM8x) has no native fp8 and Triton cannot emit ``fp8e4nv`` there,
+    so the Triton kernel's in-kernel ``.to(tl.float8e4nv)`` fails. This mirrors
+    that kernel but does GPT-J RoPE + E8M0-scaled quant in torch and casts to
+    fp8 with ``.to(torch.float8_e4m3fn)`` (torch emulates this on SM8x).
+    """
+    NOPE_DIM = index_q.shape[-1] - index_q_cos_sin_cache.shape[-1]
+    ROT_DIM = index_q_cos_sin_cache.shape[-1]
+    HALF = ROT_DIM // 2
+
+    cs = index_q_cos_sin_cache[positions.long()]
+    cos = cs[..., :HALF].to(torch.float32).unsqueeze(1)
+    sin = cs[..., HALF:].to(torch.float32).unsqueeze(1)
+
+    q_f = index_q.to(torch.float32)
+    nope = q_f[..., :NOPE_DIM] if NOPE_DIM > 0 else None
+    rope = q_f[..., NOPE_DIM:]
+    rope_e = rope[..., 0::2]
+    rope_o = rope[..., 1::2]
+    r_even = (rope_e * cos - rope_o * sin).to(torch.bfloat16).to(torch.float32)
+    r_odd = (rope_o * cos + rope_e * sin).to(torch.bfloat16).to(torch.float32)
+
+    rot_amax = torch.maximum(r_even.abs().amax(dim=-1), r_odd.abs().amax(dim=-1))
+    amax = (
+        torch.maximum(rot_amax, nope.abs().amax(dim=-1)) if NOPE_DIM > 0 else rot_amax
+    )
+    scale_raw = amax.clamp_min(1e-4) / fp8_max
+    q_scale = torch.pow(2.0, torch.ceil(torch.log2(scale_raw)))
+
+    rope_rotated = torch.empty_like(rope)
+    rope_rotated[..., 0::2] = r_even
+    rope_rotated[..., 1::2] = r_odd
+    q_full = torch.empty_like(q_f)
+    if NOPE_DIM > 0:
+        q_full[..., :NOPE_DIM] = nope
+    q_full[..., NOPE_DIM:] = rope_rotated
+
+    index_q_fp8 = (q_full / q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    iw = index_weights.to(torch.float32)
+    weights_out = iw * q_scale * index_weights_softmax_scale * index_weights_head_scale
+    return index_q_fp8, weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -364,7 +417,8 @@ def fused_indexer_q_rope_quant(
             index_q_packed, index_q_scale, _ = output_buffers
         assert index_q_packed.shape == packed_shape
         assert index_q_scale.shape == scale_shape
-        if has_cutedsl():
+        # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton.
+        if has_cutedsl() and current_platform.get_device_capability()[0] >= 9:
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -437,7 +491,22 @@ def fused_indexer_q_rope_quant(
     else:
         index_q_fp8, _ = output_buffers
         assert index_q_fp8.shape == index_q.shape
-    if has_cutedsl():
+    if current_platform.is_cuda() and current_platform.get_device_capability()[0] < 9:
+        # SM8x (Ampere): Triton cannot emit fp8e4nv; do RoPE + fp8 quant in
+        # torch (torch emulates .to(float8_e4m3fn) on SM8x).
+        q_fp8, w_out = _fused_indexer_q_rope_quant_sm86_pyref(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            fp8_max,
+        )
+        index_q_fp8.copy_(q_fp8)
+        index_weights_out.copy_(w_out)
+    # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton.
+    elif has_cutedsl() and current_platform.get_device_capability()[0] >= 9:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,

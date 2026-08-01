@@ -24,6 +24,11 @@ elif current_platform.is_xpu():
     from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+elif current_platform.is_cuda() and current_platform.get_device_capability()[0] < 9:
+    # SM8x (Ampere: A100 SM80, RTX 3080 SM86) — no FlashMLA-sparse / cutedsl.
+    # Uses the portable Triton bf16 sparse-MLA path (mirrors the XPU backend).
+    from .ampere.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+    from .ampere.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 else:
     from .nvidia.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,

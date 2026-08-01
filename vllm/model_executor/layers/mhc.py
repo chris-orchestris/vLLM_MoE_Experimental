@@ -29,6 +29,19 @@ HAS_TILELANG_MHC = _has_tilelang_mhc()
 HAS_AITER_MHC = is_aiter_found_and_supported()
 
 
+def _is_sm8x() -> bool:
+    """SM8x (Ampere) has no working TileLang MHC path.
+
+    TileLang MHC kernels assume Hopper-class features (e.g. PDL) and produce
+    incorrect results on SM8x, the same failure mode as cutedsl/deep_gemm.
+    Route ``forward_cuda`` to the portable torch/triton fallbacks instead.
+    """
+    return (
+        current_platform.is_cuda()
+        and current_platform.get_device_capability()[0] < 9
+    )
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -59,6 +72,12 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _is_sm8x():
+            return self.forward_native(
+                residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+                hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                n_splits, norm_weight, norm_eps,
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -210,6 +229,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if _is_sm8x():
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -289,6 +310,11 @@ class HCHeadOp(CustomOp):
         rms_norm_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
+        if _is_sm8x():
+            # No native torch hc_head; use the portable triton path (as XPU does).
+            return self.forward_xpu(
+                hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
+            )
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
@@ -406,6 +432,12 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _is_sm8x():
+            return self.forward_native(
+                x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+                rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+                sinkhorn_repeat, n_splits, tile_n, norm_weight, norm_eps,
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,

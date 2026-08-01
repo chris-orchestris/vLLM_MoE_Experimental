@@ -418,15 +418,23 @@ class DeepseekCompressor(nn.Module):
 
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
+        # SM8x (Ampere: A100/RTX 3080) has no cutedsl (CUTLASS-DSL / PTX 9.2),
+        # so route head=512 through the Triton store there too. The Triton store
+        # only supports the fp8_ds_mla UE8M0 layout, so the full-cache flags must
+        # be off (they are, for uint8 fp8_ds_mla kv_cache).
+        is_ampere = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability()[0] < 9
+        )
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if current_platform.is_cuda() and self.head_dim == 512 and not is_ampere:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # head=512 on Hopper/Blackwell always uses cutedsl, for both the
+            # fp8_ds_mla layout and the plain full-cache layout. The full-cache
+            # flags are consumed only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -447,7 +455,14 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128), non-CUDA GPUs (AMD, XPU), or
+            # Ampere SM8x head=512 (fp8_ds_mla only).
+            if is_ampere and self.head_dim == 512 and (store_full_kv or store_full_fp8):
+                raise NotImplementedError(
+                    "DeepSeek V4 on Ampere (SM8x) supports only the fp8_ds_mla "
+                    "UE8M0 KV layout at head_dim=512; full-cache / plain-fp8 "
+                    "store is Hopper/Blackwell (cutedsl) only."
+                )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

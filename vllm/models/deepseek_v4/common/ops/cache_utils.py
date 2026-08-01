@@ -27,6 +27,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonPointerInputVariant,
     TritonWarmupTensor,
 )
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+    _fp32_to_fp8_e4m3fn_byte,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
@@ -53,6 +56,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    use_manual_e4m3: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -130,11 +134,15 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+            # SM8x Triton cannot emit fp8e4nv casts; encode e4m3fn manually.
             if use_fnuz:
                 x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            elif use_manual_e4m3:
+                x_uint8 = _fp32_to_fp8_e4m3fn_byte(x_clamped.to(tl.float32))
             else:
                 x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -157,6 +165,90 @@ def quantize_and_insert_k_kernel(
         chunk_offsets = i * 16 + tl.arange(0, 16)
         bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+
+
+def _quantize_and_insert_k_cache_sm86_pyref(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """SM8x reference: batched UE8M0 quant + scatter (torch fp8 cast).
+
+    Ampere Triton cannot emit ``fp8e4nv``; this does the E8M0-scaled quant in
+    torch (``.to(float8_e4m3fn)`` is emulated) and scatters into the paged
+    fp8_ds_mla cache. Ported from the c2fb0133 SM86 build. OCP e4m3fn only.
+    """
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576
+    N_QUANT_BLOCKS = TOKEN_FP8_DIM // QUANT_BLOCK_SIZE  # 7
+
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    device = k.device
+    valid_idx = (slot_mapping >= 0).nonzero(as_tuple=True)[0]
+    if valid_idx.numel() == 0:
+        return
+
+    k_v = k[valid_idx]
+    slot_v = slot_mapping[valid_idx].long()
+    block_idx = slot_v // block_size
+    pos_in_block = slot_v % block_size
+    Nv = valid_idx.numel()
+
+    fp8_part = (
+        k_v[:, :TOKEN_FP8_DIM]
+        .to(torch.float32)
+        .view(Nv, N_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+    )
+    absmax = fp8_part.abs().amax(dim=-1).clamp_min(1e-4)
+    exponent = torch.ceil(torch.log2(absmax / FP8_MAX))
+    scale = torch.pow(2.0, exponent)
+    x_quant = torch.clamp(fp8_part / scale.unsqueeze(-1), -FP8_MAX, FP8_MAX).to(
+        torch.float8_e4m3fn
+    )
+    x_quant_bytes = x_quant.view(torch.uint8).reshape(Nv, TOKEN_FP8_DIM)
+
+    bf16_bytes = k_v[:, TOKEN_FP8_DIM:].contiguous().view(torch.uint8)
+    data_payload = torch.cat([x_quant_bytes, bf16_bytes], dim=1)
+
+    scale_encoded = (exponent + 127.0).clamp(0.0, 255.0).to(torch.uint8)
+    scale_payload = torch.zeros(Nv, TOKEN_SCALE_DIM, dtype=torch.uint8, device=device)
+    scale_payload[:, :N_QUANT_BLOCKS] = scale_encoded
+
+    # Scatter through the ORIGINAL (possibly non-contiguous / row-padded) view.
+    # A reshape(-1) here silently copies when stride(0) > row bytes, discarding
+    # every write; the Triton path never hits this because it uses raw pointers
+    # with k_cache.stride(0). Advanced indexing on the 2D view writes through
+    # to the base storage regardless of stride(0) padding.
+    cache_2d = k_cache if k_cache.dim() == 2 else k_cache.reshape(k_cache.shape[0], -1)
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") == "1" and not globals().get(
+        "_KINS_DBG"
+    ):
+        globals()["_KINS_DBG"] = True
+        print(
+            f"[KINS_DBG] k_cache shape={tuple(k_cache.shape)} "
+            f"stride={k_cache.stride()} contig={k_cache.is_contiguous()} "
+            f"2d_aliases={cache_2d.data_ptr() == k_cache.data_ptr()}",
+            flush=True,
+        )
+    arange_data = torch.arange(TOKEN_DATA_SIZE, device=device)
+    arange_scale = torch.arange(TOKEN_SCALE_DIM, device=device)
+
+    data_cols = (pos_in_block * TOKEN_DATA_SIZE).unsqueeze(-1) + arange_data
+    cache_2d[block_idx.unsqueeze(-1), data_cols] = data_payload
+
+    scale_cols = (
+        block_size * TOKEN_DATA_SIZE + pos_in_block * TOKEN_SCALE_DIM
+    ).unsqueeze(-1) + arange_scale
+    cache_2d[block_idx.unsqueeze(-1), scale_cols] = scale_payload
 
 
 def quantize_and_insert_k_cache(
@@ -186,6 +278,17 @@ def quantize_and_insert_k_cache(
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
+
+    # SM8x (Ampere): the Triton kernel works but must encode e4m3fn manually
+    # (no fp8e4nv casts). Capture-safe, unlike the torch pyref (.nonzero()).
+    use_manual_e4m3 = current_platform.is_cuda() and (
+        current_platform.get_device_capability()[0] < 9
+    )
+    import os
+
+    if use_manual_e4m3 and os.environ.get("VLLM_SM86_KINS_TORCH") == "1":
+        _quantize_and_insert_k_cache_sm86_pyref(k, k_cache, slot_mapping, block_size)
+        return
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -222,6 +325,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_manual_e4m3=use_manual_e4m3,
     )
 
 
@@ -307,12 +411,19 @@ def _dequantize_and_gather_k_kernel(
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    # SM8x: Triton cannot bitcast fp8e4nv; decode e4m3fn manually
+                    # (sign.4-bit exp bias7.3-bit mant).
+                    xi = x_uint8.to(tl.int32)
+                    sign = (xi >> 7) & 1
+                    exp = (xi >> 3) & 0xF
+                    mant = (xi & 0x7).to(tl.float32)
+                    normal = (1.0 + mant * 0.125) * tl.exp2(exp.to(tl.float32) - 7.0)
+                    subnorm = mant * 0.125 * tl.exp2(-6.0)
+                    x_float = tl.where(exp == 0, subnorm, normal) * (
+                        1.0 - 2.0 * sign.to(tl.float32)
+                    )
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -409,7 +520,8 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    # cutedsl (CUTLASS DSL) is Hopper/Blackwell-only; SM8x -> Triton.
+    if has_cutedsl() and current_platform.get_device_capability()[0] >= 9:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

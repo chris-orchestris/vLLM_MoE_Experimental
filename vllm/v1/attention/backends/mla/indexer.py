@@ -946,8 +946,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            # DeepGEMM is required for the paged MQA logits on CUDA devices.
+            # SM8x (Ampere) has no deep_gemm attention kernel (asserts
+            # "Unsupported architecture") and uses the bf16 pyref, which does
+            # not consume schedule_metadata, so skip building it there.
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and current_platform.get_device_capability()[0] >= 9
+            ):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,
