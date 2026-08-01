@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -115,6 +116,11 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
 # the runner's '_forward_impl' method.
 # These functions should never be called directly since they do not
 # include all the functionality of the MoE layer.
+#
+# They are break points for breakable CUDA graphs. This is required by
+# CPU-backed expert providers: their routing decisions and host-to-device
+# copies must run for every replay, not be frozen into the capture.
+@eager_break_during_capture
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -149,6 +155,7 @@ def _moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
+@eager_break_during_capture
 def _moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
