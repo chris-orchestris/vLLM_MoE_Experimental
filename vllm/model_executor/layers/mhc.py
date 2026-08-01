@@ -29,6 +29,7 @@ HAS_TILELANG_MHC = _has_tilelang_mhc()
 HAS_AITER_MHC = is_aiter_found_and_supported()
 
 
+@torch.compiler.assume_constant_result
 def _is_sm8x() -> bool:
     """SM8x (Ampere) has no working TileLang MHC path.
 
