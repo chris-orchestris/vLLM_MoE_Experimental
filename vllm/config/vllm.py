@@ -1519,17 +1519,23 @@ class VllmConfig:
             and not self.model_config.enforce_eager
         ):
             cc = self.compilation_config
-            if cc.mode != CompilationMode.VLLM_COMPILE:
+            using_breakable_cudagraph = envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            if (
+                cc.mode != CompilationMode.VLLM_COMPILE
+                and not using_breakable_cudagraph
+            ):
                 raise ValueError(
                     "--moe-expert-cache-size without --enforce-eager requires "
-                    "compilation mode VLLM_COMPILE (piecewise CUDA graphs). "
-                    "Pass --enforce-eager or remove -O overrides."
+                    "VLLM_COMPILE piecewise CUDA graphs or "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH=1. Pass --enforce-eager, "
+                    "enable breakable CUDA graphs, or remove -O overrides."
                 )
-            if cc.splitting_ops is None:
-                cc.splitting_ops = []
-            for op in ("vllm::moe_forward", "vllm::moe_forward_shared"):
-                if op not in cc.splitting_ops:
-                    cc.splitting_ops.append(op)
+            if not using_breakable_cudagraph:
+                if cc.splitting_ops is None:
+                    cc.splitting_ops = []
+                for op in ("vllm::moe_forward", "vllm::moe_forward_shared"):
+                    if op not in cc.splitting_ops:
+                        cc.splitting_ops.append(op)
             if cc.cudagraph_mode.has_full_cudagraphs():
                 logger.info(
                     "MoE expert cache: downgrading cudagraph_mode %s -> "

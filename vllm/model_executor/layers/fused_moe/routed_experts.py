@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import get_current_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
@@ -214,7 +215,10 @@ class RoutedExperts(PluggableLayer):
                 "or sequence parallelism."
             )
         vllm_config = get_current_vllm_config()
-        if not vllm_config.model_config.enforce_eager:
+        if (
+            not vllm_config.model_config.enforce_eager
+            and not is_breakable_cudagraph_enabled()
+        ):
             splitting_ops = vllm_config.compilation_config.splitting_ops or []
             if "vllm::moe_forward" not in splitting_ops:
                 raise ValueError(
