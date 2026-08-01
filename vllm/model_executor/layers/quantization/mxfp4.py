@@ -976,7 +976,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         from vllm.platforms.rocm import on_gfx1250
 
-        if self.mxfp4_backend in TRITON_BACKENDS or (
+        provider = layer.expert_weight_provider
+        if provider is not None and provider.buf_w13_scale is not None:
+            # device_loading_context restores replacement Parameters to their
+            # original CPU device after this hook. The provider owns the
+            # persistent GPU scale buffers, so bind the kernel config directly
+            # to those tensors rather than to the temporary layer Parameters.
+            assert provider.buf_w2_scale is not None
+            w1_scale = provider.buf_w13_scale
+            w2_scale = provider.buf_w2_scale
+        elif self.mxfp4_backend in TRITON_BACKENDS or (
             self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
         ):
             # TRITON backends free w13/w2_weight_scale after swizzling; the
