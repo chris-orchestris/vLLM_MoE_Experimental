@@ -63,6 +63,7 @@ from vllm.models.deepseek_v4.ampere.ampere_sparse import DeepseekV4AmpereAttenti
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _NAN_PASS = [0]
@@ -1356,6 +1357,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     continue
 
         return loaded_params
+
+    @staticmethod
+    def _pad_shared_expert_weight(
+        quant_config: QuantizationConfig | None,
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pad block-FP8 shared-expert tensors to TP-aligned blocks."""
+        block_size = getattr(quant_config, "weight_block_size", None)
+        assert block_size is not None
+        step = 1 if name.endswith("weight_scale_inv") else block_size[0]
+        dim = 1 if ".down_proj." in name else 0
+        mult = get_tensor_model_parallel_world_size() * step
+        pad = cdiv(loaded_weight.shape[dim], mult) * mult - loaded_weight.shape[dim]
+        if pad == 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[dim] = pad
+        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
