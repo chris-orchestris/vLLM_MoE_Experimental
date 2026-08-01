@@ -18,6 +18,10 @@ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+    ExpertWeightResult,
+    run_with_expert_cache,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
@@ -534,6 +538,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return True
 
     @property
+    def supports_expert_lru_cache(self) -> bool:
+        # Marlin preserves the expert dimension while repacking each expert
+        # independently.  That makes its runtime weights compatible with the
+        # slot-indexed expert cache after the canonical checkpoint weights
+        # have been repacked one bounded GPU batch at a time.
+        return self.mxfp4_backend in {
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        }
+
+    @property
     def skip_forward_padding(self) -> bool:
         # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
         # so can skip the padding in the forward before applying the moe method
@@ -588,9 +603,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
 
+        expert_weights_on_cpu = getattr(layer, "_moe_expert_cache_size", 0) > 0
+
+        def _empty_expert_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+            if expert_weights_on_cpu:
+                return torch.empty(
+                    *shape, dtype=dtype, device="cpu", pin_memory=True
+                )
+            return torch.empty(*shape, dtype=dtype)
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
-            torch.zeros(
+            _empty_expert_tensor(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
@@ -602,7 +626,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+            _empty_expert_tensor(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
@@ -616,7 +640,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.zeros(
+            _empty_expert_tensor(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
@@ -628,7 +652,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+            _empty_expert_tensor(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
@@ -662,6 +686,97 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+
+    def _setup_cached_marlin_kernel(
+        self,
+        layer: RoutedExperts,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> None:
+        """Repack CPU-backed canonical MXFP4 weights without a full-GPU copy.
+
+        Marlin consumes a different per-expert layout than the checkpoint.
+        Repack bounded batches on the worker's GPU, immediately copy the
+        transformed tensors back to pinned RAM, and release the staging batch.
+        The generic expert cache can then copy already-repacked experts into
+        fixed HBM slots on demand.
+        """
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+            prepare_moe_mxfp4_layer_for_marlin,
+        )
+
+        assert w13.device.type == "cpu" and w2.device.type == "cpu"
+        assert w13_scale.device.type == "cpu" and w2_scale.device.type == "cpu"
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts = w13.shape[0]
+        batch_size = min(32, num_experts)
+        outputs: list[torch.Tensor | None] = [None, None, None, None]
+
+        for start in range(0, num_experts, batch_size):
+            stop = min(start + batch_size, num_experts)
+            staged = (
+                w13[start:stop].to(device=device, non_blocking=True),
+                w2[start:stop].to(device=device, non_blocking=True),
+                w13_scale[start:stop].to(device=device, non_blocking=True),
+                w2_scale[start:stop].to(device=device, non_blocking=True),
+            )
+            converted = prepare_moe_mxfp4_layer_for_marlin(
+                layer,
+                staged[0],
+                staged[1],
+                staged[2],
+                staged[3],
+                None,
+                None,
+            )[:4]
+
+            for index, tensor in enumerate(converted):
+                assert isinstance(tensor, torch.Tensor)
+                output = outputs[index]
+                if output is None:
+                    output = torch.empty(
+                        num_experts,
+                        *tensor.shape[1:],
+                        dtype=tensor.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    outputs[index] = output
+                output[start:stop].copy_(tensor, non_blocking=False)
+
+            del staged, converted
+
+        repacked = tuple(outputs)
+        assert all(isinstance(tensor, torch.Tensor) for tensor in repacked)
+        repacked_w13, repacked_w2, repacked_w13_scale, repacked_w2_scale = repacked
+        assert isinstance(repacked_w13, torch.Tensor)
+        assert isinstance(repacked_w2, torch.Tensor)
+        assert isinstance(repacked_w13_scale, torch.Tensor)
+        assert isinstance(repacked_w2_scale, torch.Tensor)
+
+        replace_parameter(layer, "w13_weight", repacked_w13)
+        replace_parameter(layer, "w2_weight", repacked_w2)
+        replace_parameter(layer, "w13_weight_scale", repacked_w13_scale)
+        replace_parameter(layer, "w2_weight_scale", repacked_w2_scale)
+
+        # The cache takes ownership of the pinned backing tensors and repoints
+        # the layer's scales at its fixed, slot-indexed GPU buffers before the
+        # quant config captures them.
+        layer._maybe_init_expert_lru_cache("weight_scale")
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
+        self.moe_kernel = make_mxfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            mxfp4_backend=self.mxfp4_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+            layer=layer,
+        )
 
     def _setup_kernel(
         self,
@@ -714,6 +829,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and w2_bias.shape[0] == num_experts
                 and w2_bias.shape[1] == hidden_size
             )
+
+        if layer._moe_expert_cache_size > 0:
+            if not self.supports_expert_lru_cache:
+                raise ValueError(
+                    "MXFP4 expert caching currently requires the Marlin backend, "
+                    f"not {self.mxfp4_backend.value}."
+                )
+            if w13_bias is not None or w2_bias is not None:
+                raise ValueError("MXFP4 expert caching does not support MoE bias.")
+            self._setup_cached_marlin_kernel(
+                layer, w13, w2, w13_scale, w2_scale
+            )
+            return
 
         # Convert weights to kernel format
         w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
@@ -894,6 +1022,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = layer.expert_weight_provider
+        if provider is not None:
+
+            def run(
+                result: ExpertWeightResult, rows: slice, include_shared: bool
+            ) -> torch.Tensor:
+                assert self.moe_kernel is not None
+                return self.moe_kernel.apply(
+                    hidden_states=x[rows],
+                    w1=result.w1,
+                    w2=result.w2,
+                    topk_weights=topk_weights[rows],
+                    topk_ids=topk_ids[rows],
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    apply_router_weight_on_input=(
+                        layer.apply_router_weight_on_input
+                    ),
+                    expert_map=result.expert_map,
+                    shared_experts=shared_experts if include_shared else None,
+                    shared_experts_input=(
+                        shared_experts_input[rows]
+                        if include_shared and shared_experts_input is not None
+                        else None
+                    ),
+                )
+
+            return run_with_expert_cache(provider, topk_ids, run)
+
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
