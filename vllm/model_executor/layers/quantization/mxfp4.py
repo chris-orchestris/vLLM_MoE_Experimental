@@ -695,22 +695,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_scale: torch.Tensor,
         w2_scale: torch.Tensor,
     ) -> None:
-        """Repack CPU-backed canonical MXFP4 weights without a full-GPU copy.
+        """Repack canonical MXFP4 weights into a pinned CPU cache backing.
 
-        Marlin consumes a different per-expert layout than the checkpoint.
-        Repack bounded batches on the worker's GPU, immediately copy the
-        transformed tensors back to pinned RAM, and release the staging batch.
-        The generic expert cache can then copy already-repacked experts into
-        fixed HBM slots on demand.
+        vLLM's device-loading context temporarily moves the current layer onto
+        the worker's GPU before this hook runs. Marlin consumes a different
+        per-expert layout than the checkpoint, so repack bounded batches on
+        that GPU, immediately copy the transformed tensors to pinned RAM, and
+        release the staging batch. The generic expert cache can then copy
+        already-repacked experts into fixed HBM slots on demand.
         """
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
         )
 
-        assert w13.device.type == "cpu" and w2.device.type == "cpu"
-        assert w13_scale.device.type == "cpu" and w2_scale.device.type == "cpu"
-
         device = torch.device("cuda", torch.cuda.current_device())
+        source_tensors = (w13, w2, w13_scale, w2_scale)
+        assert all(tensor.device.type in ("cpu", "cuda") for tensor in source_tensors)
         num_experts = w13.shape[0]
         batch_size = min(32, num_experts)
         outputs: list[torch.Tensor | None] = [None, None, None, None]
