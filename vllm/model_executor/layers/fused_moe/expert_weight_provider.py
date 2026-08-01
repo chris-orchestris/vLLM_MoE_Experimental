@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_STATS_LOG_INTERVAL = 1000
+_STATS_LOG_INTERVAL = 64
 
 
 def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
@@ -88,10 +88,12 @@ class CachedWeightProvider:
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
         split: MoECacheSplit = "token",
+        name: str = "unnamed",
     ) -> None:
         num_experts = w13_weight.size(0)
 
         self.capacity = capacity
+        self.name = name
         self.split: MoECacheSplit = split
         self._num_experts = num_experts
         self.hits = 0
@@ -362,8 +364,9 @@ class CachedWeightProvider:
         if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
             total = self.hits + self.misses
             if total > 0:
-                logger.debug(
-                    "Expert cache: %d hits, %d misses (%.1f%% hit rate)",
+                logger.info(
+                    "Expert cache %s: %d hits, %d misses (%.1f%% hit rate)",
+                    self.name,
                     self.hits,
                     self.misses,
                     100.0 * self.hits / total,

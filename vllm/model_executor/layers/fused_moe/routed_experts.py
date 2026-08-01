@@ -297,6 +297,7 @@ class RoutedExperts(PluggableLayer):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             split=self._moe_expert_cache_split,
+            name=self.layer_name,
         )
         self.expert_weight_provider = provider
 
