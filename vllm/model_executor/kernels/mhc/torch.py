@@ -81,8 +81,13 @@ def mhc_pre_torch(
         comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
-    layer_input = torch.sum(
-        pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
+    # Reuse the FP32 residual prepared above and fuse the weighted reduction.
+    # The multiply-then-sum form recasts the residual and materializes another
+    # full (..., hc_mult, hidden_size) FP32 tensor.
+    layer_input = torch.einsum(
+        "bi,bih->bh",
+        pre_mix,
+        x.view(num_tokens, hc_mult, hidden_size),
     ).to(torch.bfloat16)
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
@@ -103,4 +108,9 @@ def mhc_post_torch(
         residual.to(torch.float32),
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
-    return (mixed_residual + post_term).to(residual.dtype)
+    # Both operands are fresh temporaries. Accumulating into the einsum result
+    # avoids materializing another full-size FP32 tensor, which is especially
+    # important for large chunked prefills on memory-constrained GPUs.
+    mixed_residual.add_(post_term)
+    del post_term
+    return mixed_residual.to(residual.dtype)
