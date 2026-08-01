@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -273,6 +274,7 @@ class CachedWeightProvider:
             unique[i : i + self.capacity] for i in range(0, len(unique), self.capacity)
         ]
 
+    @eager_break_during_capture
     @torch.compiler.disable
     def prepare(
         self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
@@ -411,6 +413,16 @@ def run_with_expert_cache(
     When everything fits -- the common case for both splits -- ``run`` is
     called exactly once and its result returned untouched.
     """
+    # Breakable CUDA graphs can safely replay dynamic cache preparation only
+    # when the captured graph has a fixed number of MoE kernel calls. If the
+    # total number of routed pairs fits in the cache, the unique expert count
+    # necessarily fits too, so prepare() updates its fixed GPU buffers in one
+    # eager break and the single MoE kernel remains in the following graph
+    # segment. This covers the captured decode sizes (1 and 2) without freezing
+    # their expert ids into the graph.
+    if topk_ids.numel() <= provider.capacity:
+        return run(provider.prepare(topk_ids), _ALL_ROWS, True)
+
     if provider.split == "expert":
         groups = provider.plan_expert_groups(topk_ids)
         if len(groups) == 1:
