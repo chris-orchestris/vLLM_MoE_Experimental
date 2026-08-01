@@ -53,6 +53,7 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -66,6 +67,54 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor,
+    indexer_kv_score: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run metadata-dependent V4 attention outside compiled graph segments."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    assert isinstance(layer, DeepseekV4Attention)
+    layer.attention_impl(
+        hidden_states,
+        qr,
+        kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        positions,
+        out,
+    )
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor,
+    indexer_kv_score: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)
 
 
 @triton.jit
@@ -380,7 +429,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
-        self.attention_impl(
+        torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
             qr,
             kv,
@@ -389,6 +438,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             o_padded,
+            self.prefix,
         )
         o = o_padded[:, : self.n_local_heads, :]
 
