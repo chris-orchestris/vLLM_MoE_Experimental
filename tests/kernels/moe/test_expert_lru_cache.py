@@ -40,10 +40,17 @@ def _make_provider(
     dtype: torch.dtype = torch.bfloat16,
     with_scales: bool = False,
     split: str = "token",
+    async_staging: bool | None = None,
 ):
     set_random_seed(42)
     w13, w2 = _make_weights(num_experts, dtype)
-    kwargs: dict = dict(capacity=capacity, w13_weight=w13, w2_weight=w2, split=split)
+    kwargs: dict = dict(
+        capacity=capacity,
+        w13_weight=w13,
+        w2_weight=w2,
+        split=split,
+        async_staging=async_staging,
+    )
     scales = None
     if with_scales:
         w13_s, w2_s = _make_scales(num_experts)
@@ -337,6 +344,65 @@ def test_groups_partition_all_experts():
     assert len(flat) == len(set(flat)), "an expert landed in two groups"
     for g in groups:
         assert len(g) <= provider.capacity
+
+
+def test_async_staging_double_buffers_groups_without_touching_decode_cache():
+    """Staging overlaps reusable banks while preserving every group's data."""
+    provider, w13, w2, scales = _make_provider(
+        num_experts=8,
+        capacity=2,
+        with_scales=True,
+        split="expert",
+        async_staging=True,
+    )
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    groups = provider.plan_expert_groups(topk)
+    assert groups == [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+    staged_results = []
+    mapping_snapshots = []
+    group_sums = []
+    for group_index, expert_ids in enumerate(groups):
+        result = provider.prepare_staged_group(expert_ids, group_index)
+        staged_results.append(result)
+        mapping_snapshots.append(result.expert_map.clone())
+        assert result.w1_scale is not None
+        assert result.w2_scale is not None
+        group_sums.append(
+            result.w1[: len(expert_ids)].float().sum()
+            + result.w2[: len(expert_ids)].float().sum()
+            + result.w1_scale[: len(expert_ids)].float().sum()
+            + result.w2_scale[: len(expert_ids)].float().sum()
+        )
+        provider.release_staged_group(group_index)
+
+    observed = torch.stack(group_sums).sum().cpu()
+    assert scales is not None
+    expected = (
+        w13.float().sum()
+        + w2.float().sum()
+        + scales[0].float().sum()
+        + scales[1].float().sum()
+    )
+    torch.testing.assert_close(observed, expected)
+
+    for expert_ids, mapping in zip(groups, mapping_snapshots):
+        mapping = mapping.cpu().tolist()
+        for slot, expert_id in enumerate(expert_ids):
+            assert mapping[expert_id] == slot
+        assert all(
+            mapping[expert_id] == -1
+            for expert_id in range(8)
+            if expert_id not in expert_ids
+        )
+
+    # Groups 0/2 and 1/3 reuse their respective banks only after an event.
+    assert staged_results[0].w1 is staged_results[2].w1
+    assert staged_results[1].w1 is staged_results[3].w1
+    assert staged_results[0].w1 is not staged_results[1].w1
+    assert provider.misses == 8
+    assert provider.hits == 0
+    assert provider._lru == {}, "prefill staging must preserve the decode cache"
 
 
 def test_group_count_is_independent_of_token_count():

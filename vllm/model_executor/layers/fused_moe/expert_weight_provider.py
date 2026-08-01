@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -62,6 +63,94 @@ class ExpertWeightResult:
     w2_scale: torch.Tensor | None = None
 
 
+class _SharedExpertStagingPool:
+    """Two GPU banks shared by every compatible MoE layer on one device.
+
+    Long prefills touch nearly every expert in every layer, so preserving the
+    contents of the per-layer decode cache has little value for those forwards.
+    A pair of device-wide staging banks lets the next expert group transfer on
+    a copy stream while the current group executes, without doubling all of
+    the persistent per-layer caches.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        expert_map: torch.Tensor,
+        w13_scale: torch.Tensor | None,
+        w2_scale: torch.Tensor | None,
+    ) -> None:
+        self.copy_stream = torch.cuda.Stream(device=w13.device)
+        self.banks: list[ExpertWeightResult] = []
+        for _ in range(2):
+            self.banks.append(
+                ExpertWeightResult(
+                    w1=torch.empty_like(w13, device=w13.device),
+                    w2=torch.empty_like(w2, device=w2.device),
+                    expert_map=torch.empty_like(expert_map, device=expert_map.device),
+                    w1_scale=(
+                        torch.empty_like(w13_scale, device=w13_scale.device)
+                        if w13_scale is not None
+                        else None
+                    ),
+                    w2_scale=(
+                        torch.empty_like(w2_scale, device=w2_scale.device)
+                        if w2_scale is not None
+                        else None
+                    ),
+                )
+            )
+        self.ready = [torch.cuda.Event() for _ in range(2)]
+        self.consumed = [torch.cuda.Event() for _ in range(2)]
+        self.capacity = capacity
+
+
+_SHARED_STAGING_POOLS: dict[tuple[object, ...], _SharedExpertStagingPool] = {}
+
+
+def _staging_pool_key(
+    capacity: int,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    expert_map: torch.Tensor,
+    w13_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+) -> tuple[object, ...]:
+    def tensor_key(tensor: torch.Tensor | None) -> tuple[object, ...] | None:
+        if tensor is None:
+            return None
+        return (tuple(tensor.shape), tensor.dtype, tensor.device)
+
+    return (
+        capacity,
+        tensor_key(w13),
+        tensor_key(w2),
+        tensor_key(expert_map),
+        tensor_key(w13_scale),
+        tensor_key(w2_scale),
+    )
+
+
+def _get_shared_staging_pool(
+    capacity: int,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    expert_map: torch.Tensor,
+    w13_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+) -> _SharedExpertStagingPool:
+    key = _staging_pool_key(capacity, w13, w2, expert_map, w13_scale, w2_scale)
+    pool = _SHARED_STAGING_POOLS.get(key)
+    if pool is None:
+        pool = _SharedExpertStagingPool(
+            capacity, w13, w2, expert_map, w13_scale, w2_scale
+        )
+        _SHARED_STAGING_POOLS[key] = pool
+    return pool
+
+
 class CachedWeightProvider:
     """GPU LRU cache backed by CPU pinned memory.
 
@@ -90,6 +179,7 @@ class CachedWeightProvider:
         w2_scale: torch.Tensor | None = None,
         split: MoECacheSplit = "token",
         name: str = "unnamed",
+        async_staging: bool | None = None,
     ) -> None:
         num_experts = w13_weight.size(0)
 
@@ -164,6 +254,28 @@ class CachedWeightProvider:
             (num_experts,), -1, dtype=torch.int32
         ).pin_memory()
 
+        if async_staging is None:
+            async_staging = os.getenv(
+                "VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING", "0"
+            ).lower() in {"1", "true"}
+        self._async_staging = async_staging and split == "expert"
+        self._staging_pool: _SharedExpertStagingPool | None = None
+        self._staging_mapping_hosts: list[torch.Tensor] = []
+        if self._async_staging:
+            self._staging_pool = _get_shared_staging_pool(
+                capacity,
+                self._buf_w13,
+                self._buf_w2,
+                self._mapping,
+                self._buf_w13_scale,
+                self._buf_w2_scale,
+            )
+            num_groups = (num_experts + capacity - 1) // capacity
+            self._staging_mapping_hosts = [
+                torch.full((num_experts,), -1, dtype=torch.int32).pin_memory()
+                for _ in range(num_groups)
+            ]
+
     @property
     def buf_w13(self) -> torch.Tensor:
         return self._buf_w13
@@ -186,6 +298,94 @@ class CachedWeightProvider:
         if expert_id in self._lru:
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
+
+    @property
+    def async_staging_enabled(self) -> bool:
+        return self._staging_pool is not None
+
+    def _record_prepare_stats(self, hits: int, misses: int) -> None:
+        self.hits += hits
+        self.misses += misses
+        self._prepare_calls += 1
+        if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
+            total = self.hits + self.misses
+            if total > 0:
+                logger.info(
+                    "Expert cache %s: %d hits, %d misses (%.1f%% hit rate)",
+                    self.name,
+                    self.hits,
+                    self.misses,
+                    100.0 * self.hits / total,
+                )
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def prepare_staged_group(
+        self, unique_ids: list[int], group_index: int
+    ) -> ExpertWeightResult:
+        """Stage one prefill expert group on a device-wide double buffer.
+
+        The copy stream waits before reusing a bank, while the compute stream
+        waits only for the new group to become ready. Each group owns a pinned
+        mapping mirror for the duration of the forward, so the CPU never
+        rewrites memory that an asynchronous H2D copy may still be reading.
+        """
+        pool = self._staging_pool
+        if pool is None:
+            raise RuntimeError("asynchronous expert staging is not enabled")
+        if len(unique_ids) > self.capacity:
+            raise RuntimeError(
+                f"CachedWeightProvider: {len(unique_ids)} unique experts "
+                f"requested but staging capacity is {self.capacity}."
+            )
+        if group_index >= len(self._staging_mapping_hosts):
+            raise RuntimeError(
+                f"expert staging group index {group_index} exceeds the "
+                f"{len(self._staging_mapping_hosts)} available mappings"
+            )
+
+        bank_index = group_index % 2
+        result = pool.banks[bank_index]
+        mapping_host = self._staging_mapping_hosts[group_index]
+        mapping_host.fill_(-1)
+        for slot, expert_id in enumerate(unique_ids):
+            mapping_host[expert_id] = slot
+
+        compute_stream = torch.cuda.current_stream(device=result.w1.device)
+        with torch.cuda.stream(pool.copy_stream):
+            if group_index >= 2:
+                pool.copy_stream.wait_event(pool.consumed[bank_index])
+            for slot, expert_id in enumerate(unique_ids):
+                result.w1[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
+                result.w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+                if result.w1_scale is not None:
+                    assert self._cpu_w13_scale is not None
+                    assert self._cpu_w2_scale is not None
+                    assert result.w2_scale is not None
+                    result.w1_scale[slot].copy_(
+                        self._cpu_w13_scale[expert_id], non_blocking=True
+                    )
+                    result.w2_scale[slot].copy_(
+                        self._cpu_w2_scale[expert_id], non_blocking=True
+                    )
+            result.expert_map.copy_(mapping_host, non_blocking=True)
+            pool.ready[bank_index].record(pool.copy_stream)
+
+        compute_stream.wait_event(pool.ready[bank_index])
+        self._record_prepare_stats(hits=0, misses=len(unique_ids))
+        return result
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def release_staged_group(self, group_index: int) -> None:
+        """Mark a staged bank reusable after its MoE kernel is enqueued."""
+        pool = self._staging_pool
+        if pool is None:
+            raise RuntimeError("asynchronous expert staging is not enabled")
+        bank_index = group_index % 2
+        pool.consumed[bank_index].record(
+            torch.cuda.current_stream(device=pool.banks[bank_index].w1.device)
+        )
 
     @torch.compiler.disable
     def plan_chunks(self, topk_ids: torch.Tensor) -> list[tuple[slice, list[int]]]:
@@ -362,17 +562,9 @@ class CachedWeightProvider:
                 self._lru[expert_id] = [slot, 1, self._clock]
                 self.misses += 1
 
-        self._prepare_calls += 1
-        if self._prepare_calls % _STATS_LOG_INTERVAL == 0:
-            total = self.hits + self.misses
-            if total > 0:
-                logger.info(
-                    "Expert cache %s: %d hits, %d misses (%.1f%% hit rate)",
-                    self.name,
-                    self.hits,
-                    self.misses,
-                    100.0 * self.hits / total,
-                )
+        # Hits and misses were updated in the loop because LFRU needs those
+        # counters immediately; only advance/log the prepare-call interval.
+        self._record_prepare_stats(hits=0, misses=0)
 
         # Expose exactly this group. Blocking on purpose: the host mirror is
         # rewritten by the next group, so an async copy could still be reading
@@ -433,7 +625,15 @@ def run_with_expert_cache(
         accumulator: torch.Tensor | None = None
         out_dtype: torch.dtype | None = None
         for i, expert_ids in enumerate(groups):
-            part = run(provider.prepare(topk_ids, expert_ids), _ALL_ROWS, i == 0)
+            staged = provider.async_staging_enabled
+            result = (
+                provider.prepare_staged_group(expert_ids, i)
+                if staged
+                else provider.prepare(topk_ids, expert_ids)
+            )
+            part = run(result, _ALL_ROWS, i == 0)
+            if staged:
+                provider.release_staged_group(i)
             if accumulator is None:
                 accumulator, out_dtype = part.float(), part.dtype
             else:

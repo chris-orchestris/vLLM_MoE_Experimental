@@ -115,6 +115,16 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
                 result: ExpertWeightResult, rows: slice, include_shared: bool
             ) -> torch.Tensor:
                 assert self.moe_kernel is not None
+                if result.w1_scale is not None:
+                    # Expert staging may use a device-wide weight bank rather
+                    # than this layer's persistent decode cache. Bind the
+                    # matching scale bank immediately before kernel launch;
+                    # the launch captures the tensor pointers, so later
+                    # groups can safely select the other bank.
+                    assert result.w2_scale is not None
+                    quant_config = self.moe_kernel.fused_experts.quant_config
+                    quant_config._w1.scale = result.w1_scale
+                    quant_config._w2.scale = result.w2_scale
                 return self.moe_kernel.apply(
                     hidden_states=x[rows],
                     w1=result.w1,
