@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_capture,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -190,6 +194,78 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+@eager_break_during_capture
+def _moe_forward_out(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    fused_out: torch.Tensor,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> None:
+    """Breakable-graph MoE entry with a stable caller-owned output."""
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    result = layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
+    assert isinstance(result, torch.Tensor)
+    fused_out.copy_(result)
+
+
+def _moe_forward_out_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    fused_out: torch.Tensor,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> None:
+    return
+
+
+@eager_break_during_capture
+def _moe_forward_shared_out(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    shared_out: torch.Tensor,
+    fused_out: torch.Tensor,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> None:
+    """Breakable-graph shared MoE entry with stable caller-owned outputs."""
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    result = layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
+    assert isinstance(result, tuple)
+    current_shared_out, current_fused_out = result
+    shared_out.copy_(current_shared_out)
+    fused_out.copy_(current_fused_out)
+
+
+def _moe_forward_shared_out_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    shared_out: torch.Tensor,
+    fused_out: torch.Tensor,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> None:
+    return
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
@@ -205,6 +281,24 @@ direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_out",
+    op_func=_moe_forward_out,
+    mutates_args=["fused_out"],
+    fake_impl=_moe_forward_out_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_out",
+    op_func=_moe_forward_shared_out,
+    mutates_args=["shared_out", "fused_out"],
+    fake_impl=_moe_forward_shared_out_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -287,6 +381,10 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        self._uses_breakable_expert_cache_out = (
+            is_breakable_cudagraph_enabled()
+            and routed_experts._moe_expert_cache_size > 0
+        )
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
@@ -303,6 +401,13 @@ class MoERunner(MoERunnerInterface):
             # will switch to using the moe_forward custom op.
             # Note: CPU doesn't require wrapped _forward_impl.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
+
+        if self._uses_breakable_expert_cache_out:
+            return (
+                torch.ops.vllm.moe_forward_out
+                if self._shared_experts is None
+                else torch.ops.vllm.moe_forward_shared_out
+            )
 
         return (
             torch.ops.vllm.moe_forward
@@ -718,16 +823,54 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
+        hidden_dim_unpadded = (
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
-            else 0,
+            else 0
         )
+        if self._uses_breakable_expert_cache_out:
+            fused_dim = hidden_dim_unpadded or hidden_states.shape[-1]
+            fused_output = hidden_states.new_empty(
+                (*hidden_states.shape[:-1], fused_dim)
+            )
+            if self._shared_experts is None:
+                self._forward_entry(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    fused_output,
+                    self._encode_layer_name(),
+                    hidden_dim_unpadded,
+                )
+                result = fused_output
+            else:
+                shared_shape_source = (
+                    shared_experts_input
+                    if shared_experts_input is not None
+                    else hidden_states
+                )
+                shared_output = torch.empty_like(shared_shape_source)
+                self._forward_entry(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    shared_output,
+                    fused_output,
+                    self._encode_layer_name(),
+                    hidden_dim_unpadded,
+                )
+                result = (shared_output, fused_output)
+        else:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                hidden_dim_unpadded,
+            )
 
         #
         # Note: there are two all-reduce points below. They are mutually
