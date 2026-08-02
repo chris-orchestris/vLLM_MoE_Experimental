@@ -39,8 +39,16 @@ have adequate headroom.
 
 ## Install
 
-Install [`uv`](https://docs.astral.sh/uv/), use a recent NVIDIA driver that
-supports CUDA 13, and then:
+Use a recent NVIDIA driver with CUDA 13 support. On Ubuntu 24.04, install the
+small build toolchain that Triton needs for its first kernel compile:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential python3-dev git curl
+```
+
+Install [`uv`](https://docs.astral.sh/uv/), verify that `nvidia-smi` sees the
+GPUs, and then:
 
 ```bash
 git clone https://github.com/chris-orchestris/vLLM_MoE_Experimental.git
@@ -56,9 +64,10 @@ uv pip install --editable . --torch-backend=auto
 ```
 
 The precompiled nightly supplies vLLM's compiled base extensions; this checkout
-overlays the experimental Python and Triton code. The optional native
-host-all-reduce helpers under `csrc/host_all_reduce/` are not required by these
-quick-start profiles.
+overlays the experimental Python and Triton code. Run the install with the GPUs
+visible so `--torch-backend=auto` selects CUDA rather than CPU PyTorch. The
+optional native host-all-reduce helpers under `csrc/host_all_reduce/` are not
+required by these quick-start profiles.
 
 ## Common launch settings
 
