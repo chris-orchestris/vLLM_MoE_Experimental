@@ -6,23 +6,27 @@ import importlib.util
 import math
 import mmap
 import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Literal
 
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
 _STATS_LOG_INTERVAL = 64
 
 _BATCH_COPY_FUNCTIONS: dict[str, Callable[..., int]] = {}
+_EXCLUSIVE_SWAP_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _REGISTERED_HOST_ALLOCATIONS: list[tuple[mmap.mmap, int, int]] = []
 _WRITE_COMBINED_HOST_ALLOCATIONS: list[tuple[ctypes.c_void_p, object]] = []
-_MAPPED_TENSOR_EXTENSION: object | None = None
+_MAPPED_TENSOR_EXTENSION: ModuleType | None = None
 _MAPPED_TENSOR_CUDART: ctypes.CDLL | None = None
 
 
@@ -69,8 +73,7 @@ def _mapped_cuda_alias(host_tensor: torch.Tensor) -> torch.Tensor:
     )
     if error != 0 or device_pointer.value is None:
         raise RuntimeError(
-            "cudaHostGetDevicePointer for expert scales failed with CUDA "
-            f"error {error}"
+            f"cudaHostGetDevicePointer for expert scales failed with CUDA error {error}"
         )
 
     extension = _MAPPED_TENSOR_EXTENSION
@@ -82,7 +85,7 @@ def _mapped_cuda_alias(host_tensor: torch.Tensor) -> torch.Tensor:
     mapped = extension.mapped_cuda_tensor_typed(
         device_pointer.value,
         list(host_tensor.shape),
-        torch.cuda.current_device(),
+        torch.accelerator.current_device_index(),
         dtype_name,
     )
     if mapped.dtype != host_tensor.dtype:
@@ -107,6 +110,33 @@ def _load_batch_copy_function(library_path: str) -> Callable[..., int]:
     ]
     function.restype = ctypes.c_int
     _BATCH_COPY_FUNCTIONS[library_path] = function
+    return function
+
+
+def _load_exclusive_swap_function(library_path: str) -> Callable[..., int]:
+    function = _EXCLUSIVE_SWAP_FUNCTIONS.get(library_path)
+    if function is not None:
+        return function
+
+    library = ctypes.CDLL(library_path)
+    function = library.vllm_cuda_exclusive_expert_swap_wave_async
+    pointer_array = ctypes.POINTER(ctypes.c_uint64)
+    function.argtypes = [
+        pointer_array,
+        pointer_array,
+        pointer_array,
+        pointer_array,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    _EXCLUSIVE_SWAP_FUNCTIONS[library_path] = function
     return function
 
 
@@ -151,8 +181,7 @@ def registered_host_empty(
     )
     mapping_address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
     address = (
-        (mapping_address + huge_page_bytes - 1) // huge_page_bytes
-        * huge_page_bytes
+        (mapping_address + huge_page_bytes - 1) // huge_page_bytes * huge_page_bytes
     )
     mapping_offset = address - mapping_address
 
@@ -180,8 +209,53 @@ def registered_host_empty(
     tensor = storage.view(dtype).view(*shape)
     _REGISTERED_HOST_ALLOCATIONS.append((mapping, address, registered_bytes))
     logger.info_once(
-        "Using 2 MiB-aligned CUDA-registered host backing for repacked "
-        "expert weights.",
+        "Using 2 MiB-aligned CUDA-registered host backing for repacked expert weights.",
+        scope="global",
+    )
+    return tensor
+
+
+def file_backed_host_empty(
+    *shape: int,
+    dtype: torch.dtype,
+    staging_dir: str | None = None,
+) -> torch.Tensor:
+    """Allocate a reclaimable temporary tensor on the configured filesystem."""
+    staging_dir = staging_dir or os.environ.get("VLLM_MOE_EXPERT_CACHE_STAGING_DIR")
+    if not staging_dir:
+        raise RuntimeError(
+            "exclusive expert caching requires "
+            "VLLM_MOE_EXPERT_CACHE_STAGING_DIR on a disk-backed filesystem"
+        )
+    os.makedirs(staging_dir, exist_ok=True)
+    elements = math.prod(shape)
+    tensor_bytes = elements * dtype.itemsize
+    descriptor, path = tempfile.mkstemp(
+        prefix="vllm-exclusive-experts-",
+        dir=staging_dir,
+    )
+    try:
+        os.posix_fallocate(descriptor, 0, tensor_bytes)
+        os.close(descriptor)
+        descriptor = -1
+        tensor = torch.from_file(
+            path,
+            shared=True,
+            size=elements,
+            dtype=dtype,
+        ).view(*shape)
+        # The mapping remains valid and reclaimable after unlink. Its blocks
+        # are released automatically when the tensor is replaced or on exit.
+        os.unlink(path)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if os.path.exists(path):
+            os.unlink(path)
+        raise
+    logger.info_once(
+        "Using reclaimable filesystem-backed staging for exclusive expert "
+        "cache initialization.",
         scope="global",
     )
     return tensor
@@ -213,18 +287,14 @@ def write_combined_host_empty(
     cudart.cudaHostAlloc.restype = ctypes.c_int
     base_pointer = ctypes.c_void_p()
     # cudaHostAllocPortable | cudaHostAllocWriteCombined.
-    error = cudart.cudaHostAlloc(
-        ctypes.byref(base_pointer), allocation_bytes, 1 | 4
-    )
+    error = cudart.cudaHostAlloc(ctypes.byref(base_pointer), allocation_bytes, 1 | 4)
     if error != 0 or base_pointer.value is None:
         raise RuntimeError(
             "cudaHostAlloc for write-combined expert backing failed with "
             f"CUDA error {error}"
         )
 
-    address = (
-        (base_pointer.value + alignment - 1) // alignment * alignment
-    )
+    address = (base_pointer.value + alignment - 1) // alignment * alignment
     owner = (ctypes.c_uint8 * tensor_bytes).from_address(address)
     storage = torch.frombuffer(owner, dtype=torch.uint8, count=tensor_bytes)
     tensor = storage.view(dtype).view(*shape)
@@ -451,6 +521,7 @@ class CachedWeightProvider:
         split: MoECacheSplit = "token",
         name: str = "unnamed",
         async_staging: bool | None = None,
+        exclusive: bool = False,
     ) -> None:
         num_experts = w13_weight.size(0)
 
@@ -458,6 +529,9 @@ class CachedWeightProvider:
         self.name = name
         self.split: MoECacheSplit = split
         self._num_experts = num_experts
+        self.exclusive = exclusive
+        if exclusive and capacity >= num_experts:
+            raise ValueError("exclusive expert caching requires capacity < num_experts")
         self.hits = 0
         self.misses = 0
         self._prepare_calls = 0
@@ -466,9 +540,7 @@ class CachedWeightProvider:
         )
         if self._route_stats_min_tokens < 0:
             raise ValueError("VLLM_MOE_ROUTE_STATS_MIN_TOKENS must be >= 0")
-        self._route_stats_arm_file = os.getenv(
-            "VLLM_MOE_ROUTE_STATS_ARM_FILE", ""
-        )
+        self._route_stats_arm_file = os.getenv("VLLM_MOE_ROUTE_STATS_ARM_FILE", "")
         self._route_stats_logged = False
         self._borrowed_banks: list[_BorrowedExpertBank] = []
 
@@ -519,22 +591,47 @@ class CachedWeightProvider:
         self._mapped_scales = os.getenv(
             "VLLM_MOE_EXPERT_CACHE_MAPPED_SCALES", "0"
         ).lower() in {"1", "true"}
+        if exclusive and self._mapped_scales:
+            raise ValueError(
+                "exclusive expert caching is incompatible with mapped scales"
+            )
+        if exclusive and self._bulk_prefill_min_tokens > 0:
+            raise ValueError(
+                "exclusive expert caching is incompatible with the bulk-prefill "
+                "cache path; use asynchronous staging instead"
+            )
+        if exclusive and self._batched_copy_min_experts > 0:
+            raise ValueError(
+                "exclusive expert caching has its own bidirectional batched-copy "
+                "path; disable VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_MIN_EXPERTS"
+            )
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
         else:
             cuda_device = w13_weight.device
-        self._cpu_w13: torch.Tensor = _pinned_cpu_copy(w13_weight)
-        self._cpu_w2: torch.Tensor = _pinned_cpu_copy(w2_weight)
+        # Exclusive initialization copies directly from the layer parameters
+        # into the compact backing. Materializing a full pinned copy first is
+        # wasteful and, more importantly, the pinned allocator may retain each
+        # released full-size allocation until all layers have been converted.
+        # That defeats the RAM-saving mode during load and can force swapping.
+        self._cpu_w13: torch.Tensor = (
+            w13_weight if exclusive else _pinned_cpu_copy(w13_weight)
+        )
+        self._cpu_w2: torch.Tensor = (
+            w2_weight if exclusive else _pinned_cpu_copy(w2_weight)
+        )
+
+        device_capacity = capacity + 1 if exclusive else capacity
 
         self._buf_w13: torch.Tensor = torch.empty(
-            capacity,
+            device_capacity,
             *w13_weight.shape[1:],
             dtype=w13_weight.dtype,
             device=cuda_device,
         )
         self._buf_w2: torch.Tensor = torch.empty(
-            capacity,
+            device_capacity,
             *w2_weight.shape[1:],
             dtype=w2_weight.dtype,
             device=cuda_device,
@@ -543,8 +640,12 @@ class CachedWeightProvider:
         if w13_scale is not None and w2_scale is not None:
             # Pinned for the same reason the weights are: these are copied on
             # every miss, and pageable source memory forces a staging copy.
-            self._cpu_w13_scale: torch.Tensor | None = _pinned_cpu_copy(w13_scale)
-            self._cpu_w2_scale: torch.Tensor | None = _pinned_cpu_copy(w2_scale)
+            self._cpu_w13_scale: torch.Tensor | None = (
+                w13_scale if exclusive else _pinned_cpu_copy(w13_scale)
+            )
+            self._cpu_w2_scale: torch.Tensor | None = (
+                w2_scale if exclusive else _pinned_cpu_copy(w2_scale)
+            )
             if self._mapped_scales:
                 default_banks = math.ceil(num_experts / capacity)
                 mapped_scale_banks = int(
@@ -552,12 +653,8 @@ class CachedWeightProvider:
                 )
                 if mapped_scale_banks <= 0:
                     raise ValueError("VLLM_MOE_MAPPED_SCALE_BANKS must be positive")
-                self._mapped_scale_hosts: list[
-                    tuple[torch.Tensor, torch.Tensor]
-                ] = []
-                self._mapped_scale_aliases: list[
-                    tuple[torch.Tensor, torch.Tensor]
-                ] = []
+                self._mapped_scale_hosts: list[tuple[torch.Tensor, torch.Tensor]] = []
+                self._mapped_scale_aliases: list[tuple[torch.Tensor, torch.Tensor]] = []
                 for _ in range(mapped_scale_banks):
                     w13_host = torch.empty(
                         capacity,
@@ -583,9 +680,7 @@ class CachedWeightProvider:
                 self._mapped_scale_in_use = [False] * mapped_scale_banks
                 self._mapped_scale_cursor = 0
                 self.mapped_scale_waits = 0
-                self._buf_w13_scale, self._buf_w2_scale = (
-                    self._mapped_scale_aliases[0]
-                )
+                self._buf_w13_scale, self._buf_w2_scale = self._mapped_scale_aliases[0]
                 logger.info_once(
                     "Using CUDA-mapped host scales for the expert cache; "
                     "cache groups rotate over %d host scale banks.",
@@ -594,13 +689,13 @@ class CachedWeightProvider:
                 )
             else:
                 self._buf_w13_scale = torch.empty(
-                    capacity,
+                    device_capacity,
                     *w13_scale.shape[1:],
                     dtype=w13_scale.dtype,
                     device=cuda_device,
                 )
                 self._buf_w2_scale = torch.empty(
-                    capacity,
+                    device_capacity,
                     *w2_scale.shape[1:],
                     dtype=w2_scale.dtype,
                     device=cuda_device,
@@ -619,11 +714,41 @@ class CachedWeightProvider:
             self._mapped_scale_events = []
             self._mapped_scale_in_use = []
 
+        self._exclusive_swap_function: Callable[..., int] | None = None
+        self._exclusive_h2d_stream: torch.Stream | None = None
+        self._exclusive_d2h_stream: torch.Stream | None = None
+        self._exclusive_h2d_done: torch.Event | None = None
+        self._exclusive_d2h_done: torch.Event | None = None
+        self._exclusive_swap_started = False
+        self._exclusive_host_read_events: dict[int, torch.Event] = {}
+        self._exclusive_host_slots: list[int] = []
+        self._exclusive_host_experts: list[int] = []
+        self._exclusive_host_spare = -1
+        self._exclusive_gpu_spare = -1
+        self._exclusive_gpu_row_pointers: list[list[int]] = []
+        self._exclusive_host_row_pointers: list[list[int]] = []
+        self._exclusive_copy_sizes: list[int] = []
+        self._exclusive_gpu_destinations: ctypes.Array[ctypes.c_uint64] | None = None
+        self._exclusive_host_sources: ctypes.Array[ctypes.c_uint64] | None = None
+        self._exclusive_host_destinations: ctypes.Array[ctypes.c_uint64] | None = None
+        self._exclusive_gpu_sources: ctypes.Array[ctypes.c_uint64] | None = None
+        self._exclusive_sizes: ctypes.Array[ctypes.c_size_t] | None = None
+        if exclusive:
+            self._initialize_exclusive_backing(cuda_device)
+
         # LFRU state: {expert_id: [slot, freq, last_access_clock]}
         # Eviction score = freq / (clock - last_access + 1). Lower = evict first.
-        self._lru: dict[int, list] = {}
-        self._clock: int = 0
-        self._free_slots: list[int] = list(range(capacity))
+        if exclusive:
+            self._lru = {
+                expert_id: [expert_id, 1, expert_id + 1]
+                for expert_id in range(capacity)
+            }
+            self._clock = capacity
+            self._free_slots = []
+        else:
+            self._lru = {}
+            self._clock = 0
+            self._free_slots = list(range(capacity))
 
         # Expert map handed to the kernel: expert id to slot for the group
         # being evaluated, -1 for everything else. Rebuilt each prepare() --
@@ -643,9 +768,7 @@ class CachedWeightProvider:
         self._batched_copy_stream: torch.cuda.Stream | None = None
         self._batched_copy_ready: torch.cuda.Event | None = None
         if self._batched_copy_min_experts > 0:
-            library_path = os.getenv(
-                "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY"
-            )
+            library_path = os.getenv("VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY")
             if not library_path:
                 raise RuntimeError(
                     "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY must point "
@@ -687,9 +810,7 @@ class CachedWeightProvider:
                 "VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING", "0"
             ).lower() in {"1", "true"}
         if self._mapped_scales and async_staging:
-            raise ValueError(
-                "mapped expert scales do not support asynchronous staging"
-            )
+            raise ValueError("mapped expert scales do not support asynchronous staging")
         self._async_staging = async_staging and split == "expert"
         self._interlayer_prefetch = self._async_staging and os.getenv(
             "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "0"
@@ -702,8 +823,7 @@ class CachedWeightProvider:
         )
         if self._interlayer_prefetch_min_tokens < 0:
             raise ValueError(
-                "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS "
-                "must be >= 0"
+                "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS must be >= 0"
             )
         self._staging_pool: _SharedExpertStagingPool | None = None
         self._staging_capacity = capacity
@@ -751,6 +871,288 @@ class CachedWeightProvider:
                 if self._lookahead_registry_key is not None:
                     _INTERLAYER_PROVIDERS[self._lookahead_registry_key] = self
 
+    def _allocate_exclusive_host_tensor(
+        self, source: torch.Tensor, host_rows: int
+    ) -> torch.Tensor:
+        shape = (host_rows, *source.shape[1:])
+        registered = os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_REGISTERED_BACKING", "0"
+        ).lower() in {"1", "true"}
+        if registered:
+            return registered_host_empty(*shape, dtype=source.dtype)
+        return torch.empty(
+            *shape,
+            dtype=source.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    def _initialize_exclusive_backing(self, cuda_device: torch.device) -> None:
+        """Split one full expert tensor set into compact CPU and GPU ownership.
+
+        One spare row is retained on each side. A miss exchanges the incoming
+        CPU row with a GPU victim through those distinct spares, allowing H2D
+        and D2H to overlap without either DMA engine touching the same memory.
+        """
+        host_experts = self._num_experts - self.capacity
+        host_rows = host_experts + 1
+        sources = [self._cpu_w13, self._cpu_w2]
+        if self._cpu_w13_scale is not None:
+            assert self._cpu_w2_scale is not None
+            sources.extend([self._cpu_w13_scale, self._cpu_w2_scale])
+
+        gpu_tensors = [self._buf_w13, self._buf_w2]
+        if self._buf_w13_scale is not None:
+            assert self._buf_w2_scale is not None
+            gpu_tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
+
+        current_stream = current_platform.current_stream(cuda_device)
+        for gpu_tensor, source in zip(gpu_tensors, sources):
+            gpu_tensor[: self.capacity].copy_(
+                source[: self.capacity], non_blocking=True
+            )
+
+        compact = []
+        for source in sources:
+            target = self._allocate_exclusive_host_tensor(source, host_rows)
+            target[:host_experts].copy_(source[self.capacity :])
+            compact.append(target)
+
+        # The full source parameters are released as soon as this provider is
+        # installed. Ensure their initial resident uploads have consumed them.
+        current_stream.synchronize()
+        self._cpu_w13, self._cpu_w2 = compact[:2]
+        if len(compact) == 4:
+            self._cpu_w13_scale, self._cpu_w2_scale = compact[2:]
+
+        self._exclusive_host_slots = [-1] * self.capacity + list(range(host_experts))
+        self._exclusive_host_experts = list(range(self.capacity, self._num_experts)) + [
+            -1
+        ]
+        self._exclusive_host_spare = host_experts
+        self._exclusive_gpu_spare = self.capacity
+
+        library_path = os.getenv("VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY")
+        if not library_path:
+            raise RuntimeError(
+                "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY must point to "
+                "the compiled exclusive expert-swap helper"
+            )
+        self._exclusive_swap_function = _load_exclusive_swap_function(library_path)
+        self._exclusive_h2d_stream = current_platform.Stream(device=cuda_device)
+        self._exclusive_d2h_stream = current_platform.Stream(device=cuda_device)
+        self._exclusive_h2d_done = current_platform.Event()
+        self._exclusive_d2h_done = current_platform.Event()
+        # Materialize reusable cudaEvent_t handles once. The native wave shim
+        # records these after every swap and leaves the final record visible
+        # to the compute stream and all later host-row readers.
+        self._exclusive_h2d_done.record(self._exclusive_h2d_stream)
+        self._exclusive_d2h_done.record(self._exclusive_d2h_stream)
+
+        self._exclusive_gpu_row_pointers = []
+        self._exclusive_host_row_pointers = []
+        self._exclusive_copy_sizes = []
+        for gpu_tensor, host_tensor in zip(gpu_tensors, compact):
+            if not gpu_tensor[0].is_contiguous() or not host_tensor[0].is_contiguous():
+                raise RuntimeError(
+                    "exclusive expert swaps require contiguous per-expert tensors"
+                )
+            gpu_stride = gpu_tensor.stride(0) * gpu_tensor.element_size()
+            host_stride = host_tensor.stride(0) * host_tensor.element_size()
+            self._exclusive_gpu_row_pointers.append(
+                [
+                    gpu_tensor.data_ptr() + row * gpu_stride
+                    for row in range(gpu_tensor.size(0))
+                ]
+            )
+            self._exclusive_host_row_pointers.append(
+                [
+                    host_tensor.data_ptr() + row * host_stride
+                    for row in range(host_tensor.size(0))
+                ]
+            )
+            self._exclusive_copy_sizes.append(
+                host_tensor[0].numel() * host_tensor.element_size()
+            )
+
+        copies_per_swap = len(self._exclusive_copy_sizes)
+        max_wave_copies = self.capacity * copies_per_swap
+        pointer_array = ctypes.c_uint64 * max_wave_copies
+        self._exclusive_gpu_destinations = pointer_array()
+        self._exclusive_host_sources = pointer_array()
+        self._exclusive_host_destinations = pointer_array()
+        self._exclusive_gpu_sources = pointer_array()
+        self._exclusive_sizes = (ctypes.c_size_t * max_wave_copies)()
+        for swap_index in range(self.capacity):
+            base = swap_index * copies_per_swap
+            for copy_index, copy_size in enumerate(self._exclusive_copy_sizes):
+                self._exclusive_sizes[base + copy_index] = copy_size
+
+        source_bytes = sum(source.numel() * source.element_size() for source in sources)
+        compact_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in compact
+        )
+        logger.info_once(
+            "Exclusive CPU/GPU expert cache enabled: %d GPU residents plus "
+            "one GPU/CPU rotating spare; compact host backing saves %.2f GiB "
+            "per compatible provider set before allocator overhead.",
+            self.capacity,
+            (source_bytes - compact_bytes) / (1 << 30),
+            scope="global",
+        )
+
+    def _cpu_expert_row(self, tensor: torch.Tensor, expert_id: int) -> torch.Tensor:
+        if not self.exclusive:
+            return tensor[expert_id]
+        host_slot = self._exclusive_host_slots[expert_id]
+        if host_slot < 0:
+            raise RuntimeError(
+                f"expert {expert_id} is GPU-owned and has no CPU backing row"
+            )
+        return tensor[host_slot]
+
+    def _wait_for_exclusive_host_updates(self, stream: torch.Stream) -> None:
+        """Keep a host-row reader behind the most recent D2H ownership move."""
+        if self.exclusive and self._exclusive_swap_started:
+            event = self._exclusive_d2h_done
+            assert event is not None
+            stream.wait_event(event)
+
+    def _record_exclusive_host_reads(self, stream: torch.Stream) -> None:
+        """Protect host rows until all H2D readers on *stream* are finished."""
+        if not self.exclusive:
+            return
+        stream_handle = stream.cuda_stream
+        event = self._exclusive_host_read_events.get(stream_handle)
+        if event is None:
+            event = current_platform.Event()
+            self._exclusive_host_read_events[stream_handle] = event
+        event.record(stream)
+
+    def _begin_exclusive_swaps(self, compute_stream: torch.Stream) -> None:
+        """Protect GPU victims and host rows before the first swap in a wave."""
+        d2h_stream = self._exclusive_d2h_stream
+        if d2h_stream is None:
+            raise RuntimeError("exclusive expert-cache D2H stream is unavailable")
+        d2h_stream.wait_stream(compute_stream)
+        for event in self._exclusive_host_read_events.values():
+            d2h_stream.wait_event(event)
+
+    def _plan_exclusive_swap(
+        self,
+        incoming_id: int,
+        victim_id: int,
+        victim_slot: int,
+    ) -> tuple[int, tuple[int, int, int, int]]:
+        """Rotate ownership metadata and return one native-wave slot plan."""
+        incoming_host_slot = self._exclusive_host_slots[incoming_id]
+        host_spare = self._exclusive_host_spare
+        gpu_spare = self._exclusive_gpu_spare
+        if incoming_host_slot < 0:
+            raise RuntimeError(f"expert {incoming_id} is not CPU-owned")
+        if self._exclusive_host_experts[incoming_host_slot] != incoming_id:
+            raise RuntimeError("exclusive expert-cache host ownership is corrupt")
+        if self._exclusive_host_experts[host_spare] != -1:
+            raise RuntimeError("exclusive expert-cache host spare is occupied")
+
+        self._exclusive_host_slots[incoming_id] = -1
+        self._exclusive_host_slots[victim_id] = host_spare
+        self._exclusive_host_experts[host_spare] = victim_id
+        self._exclusive_host_experts[incoming_host_slot] = -1
+        self._exclusive_host_spare = incoming_host_slot
+        self._exclusive_gpu_spare = victim_slot
+        slots = (gpu_spare, incoming_host_slot, host_spare, victim_slot)
+        return gpu_spare, slots
+
+    def _queue_exclusive_swap_wave(
+        self,
+        swaps: list[tuple[int, int, int, int]],
+    ) -> None:
+        """Submit all misses from one prepare() through one native call."""
+        if not swaps:
+            return
+        if len(swaps) > self.capacity:
+            raise RuntimeError("exclusive expert-cache swap wave exceeds capacity")
+
+        function = self._exclusive_swap_function
+        h2d_stream = self._exclusive_h2d_stream
+        d2h_stream = self._exclusive_d2h_stream
+        h2d_done = self._exclusive_h2d_done
+        d2h_done = self._exclusive_d2h_done
+        gpu_destinations = self._exclusive_gpu_destinations
+        host_sources = self._exclusive_host_sources
+        host_destinations = self._exclusive_host_destinations
+        gpu_sources = self._exclusive_gpu_sources
+        sizes = self._exclusive_sizes
+        if (
+            function is None
+            or h2d_stream is None
+            or d2h_stream is None
+            or h2d_done is None
+            or d2h_done is None
+            or gpu_destinations is None
+            or host_sources is None
+            or host_destinations is None
+            or gpu_sources is None
+            or sizes is None
+        ):
+            raise RuntimeError("exclusive expert-cache swap path is unavailable")
+
+        self._begin_exclusive_swaps(
+            current_platform.current_stream(self._buf_w13.device)
+        )
+        if self._exclusive_swap_started:
+            # The prior wave may still own both rotating spares. Capture its
+            # final event records before the native shim starts reusing them.
+            h2d_stream.wait_event(d2h_done)
+            d2h_stream.wait_event(h2d_done)
+
+        copies_per_swap = len(self._exclusive_copy_sizes)
+        for swap_index, (
+            gpu_destination_slot,
+            host_source_slot,
+            host_destination_slot,
+            gpu_source_slot,
+        ) in enumerate(swaps):
+            base = swap_index * copies_per_swap
+            for copy_index in range(copies_per_swap):
+                index = base + copy_index
+                gpu_destinations[index] = self._exclusive_gpu_row_pointers[copy_index][
+                    gpu_destination_slot
+                ]
+                host_sources[index] = self._exclusive_host_row_pointers[copy_index][
+                    host_source_slot
+                ]
+                host_destinations[index] = self._exclusive_host_row_pointers[
+                    copy_index
+                ][host_destination_slot]
+                gpu_sources[index] = self._exclusive_gpu_row_pointers[copy_index][
+                    gpu_source_slot
+                ]
+
+        device_index = self._buf_w13.device.index
+        assert device_index is not None
+        error = function(
+            gpu_destinations,
+            host_sources,
+            host_destinations,
+            gpu_sources,
+            sizes,
+            len(swaps),
+            copies_per_swap,
+            h2d_stream.cuda_stream,
+            d2h_stream.cuda_stream,
+            h2d_done.cuda_event,
+            d2h_done.cuda_event,
+            device_index,
+        )
+        if error != 0:
+            raise RuntimeError(
+                "exclusive cudaMemcpyBatchAsync swap wave failed with "
+                f"CUDA error {error}"
+            )
+        self._exclusive_swap_started = True
+
     @staticmethod
     def _parse_layer_registry_key(
         name: str, device: torch.device
@@ -766,7 +1168,7 @@ class CachedWeightProvider:
             return None
         device_index = device.index
         if device_index is None:
-            device_index = torch.cuda.current_device()
+            device_index = torch.accelerator.current_device_index()
         return device_index, prefix, layer_index
 
     @property
@@ -861,9 +1263,7 @@ class CachedWeightProvider:
         if self._buf_w13_scale is not None:
             assert self._buf_w2_scale is not None
             tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
-        return [
-            (tensor.dtype, (capacity, *tensor.shape[1:])) for tensor in tensors
-        ]
+        return [(tensor.dtype, (capacity, *tensor.shape[1:])) for tensor in tensors]
 
     def attach_borrowed_buffers(
         self,
@@ -940,6 +1340,14 @@ class CachedWeightProvider:
         if not bank.enabled or topk_ids.size(0) < bank.min_tokens:
             return []
 
+        if self.exclusive:
+            # Decode can promote an expert which a prior prefill left in a
+            # borrowed bank. The primary copy is then authoritative, so retire
+            # the duplicate before selecting the next borrowed group.
+            for expert_id in list(bank.slots):
+                if expert_id in self._lru:
+                    bank.free_slots.append(bank.slots.pop(expert_id))
+
         used = set(valid_unique_ids)
         group = [
             expert_id
@@ -951,12 +1359,15 @@ class CachedWeightProvider:
             candidates = [
                 expert_id
                 for expert_id in valid_unique_ids
-                if expert_id not in bank.slots and expert_id not in excluded_ids
+                if expert_id not in bank.slots
+                and expert_id not in excluded_ids
+                and (not self.exclusive or expert_id not in self._lru)
             ]
             group.extend(candidates[:vacancies])
 
-        for expert_id in group:
-            self.invalidate(expert_id)
+        if not self.exclusive:
+            for expert_id in group:
+                self.invalidate(expert_id)
         return group
 
     def plan_borrowed_groups(
@@ -967,9 +1378,7 @@ class CachedWeightProvider:
     ) -> list[tuple[int, list[int]]]:
         """Choose disjoint expert groups for every still-active KV tier."""
         valid_unique_ids = [
-            expert_id
-            for expert_id in unique_ids
-            if 0 <= expert_id < self._num_experts
+            expert_id for expert_id in unique_ids if 0 <= expert_id < self._num_experts
         ]
         excluded = set() if excluded_ids is None else set(excluded_ids)
         groups: list[tuple[int, list[int]]] = []
@@ -989,13 +1398,9 @@ class CachedWeightProvider:
         if not self._borrowed_banks:
             return []
         valid_unique_ids = [
-            expert_id
-            for expert_id in unique_ids
-            if 0 <= expert_id < self._num_experts
+            expert_id for expert_id in unique_ids if 0 <= expert_id < self._num_experts
         ]
-        return self._plan_one_borrowed_group(
-            0, topk_ids, valid_unique_ids, set()
-        )
+        return self._plan_one_borrowed_group(0, topk_ids, valid_unique_ids, set())
 
     @eager_break_during_capture
     @torch.compiler.disable
@@ -1011,6 +1416,8 @@ class CachedWeightProvider:
         if len(expert_ids) > bank.capacity:
             raise RuntimeError("borrowed expert group exceeds its capacity")
 
+        copy_stream = current_platform.current_stream(bank.w13.device)
+        self._wait_for_exclusive_host_updates(copy_stream)
         for expert_id in expert_ids:
             if expert_id in bank.slots:
                 continue
@@ -1018,23 +1425,32 @@ class CachedWeightProvider:
                 raise RuntimeError("borrowed expert bank has no free slot")
             slot = bank.free_slots.pop()
             bank.slots[expert_id] = slot
-            bank.w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
-            bank.w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+            bank.w13[slot].copy_(
+                self._cpu_expert_row(self._cpu_w13, expert_id),
+                non_blocking=True,
+            )
+            bank.w2[slot].copy_(
+                self._cpu_expert_row(self._cpu_w2, expert_id),
+                non_blocking=True,
+            )
             if bank.w13_scale is not None:
                 assert self._cpu_w13_scale is not None
                 assert self._cpu_w2_scale is not None
                 assert bank.w2_scale is not None
                 bank.w13_scale[slot].copy_(
-                    self._cpu_w13_scale[expert_id], non_blocking=True
+                    self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                    non_blocking=True,
                 )
                 bank.w2_scale[slot].copy_(
-                    self._cpu_w2_scale[expert_id], non_blocking=True
+                    self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                    non_blocking=True,
                 )
 
         bank.mapping_host.fill_(-1)
         for expert_id in expert_ids:
             bank.mapping_host[expert_id] = bank.slots[expert_id]
         bank.mapping.copy_(bank.mapping_host)
+        self._record_exclusive_host_reads(copy_stream)
         return ExpertWeightResult(
             w1=bank.w13,
             w2=bank.w2,
@@ -1047,6 +1463,11 @@ class CachedWeightProvider:
         """Remove *expert_id* from the cache, returning its slot to the free
         list.  No-op if the expert is not currently cached."""
         if expert_id in self._lru:
+            if self.exclusive:
+                raise RuntimeError(
+                    "exclusive expert-cache residents must be exchanged, not "
+                    "invalidated"
+                )
             entry = self._lru.pop(expert_id)
             self._free_slots.append(entry[0])
 
@@ -1070,10 +1491,7 @@ class CachedWeightProvider:
         # nearly every primary slot remains useful. Conversely, a handful of
         # decode entries is not enough to justify bypassing the normal fill.
         minimum_residency = max(1, (self.capacity + 1) // 2)
-        return (
-            self._staging_pool is not None
-            and len(self._lru) >= minimum_residency
-        )
+        return self._staging_pool is not None and len(self._lru) >= minimum_residency
 
     def group_is_resident(self, expert_ids: list[int]) -> bool:
         """Whether every expert in a planned group is in the layer cache."""
@@ -1102,15 +1520,10 @@ class CachedWeightProvider:
     def prefetch_successor(self, num_tokens: int) -> None:
         """Upload one predicted group for the next MoE layer."""
         key = self._lookahead_registry_key
-        if (
-            key is None
-            or num_tokens < self._interlayer_prefetch_min_tokens
-        ):
+        if key is None or num_tokens < self._interlayer_prefetch_min_tokens:
             return
         device_index, prefix, layer_index = key
-        successor = _INTERLAYER_PROVIDERS.get(
-            (device_index, prefix, layer_index + 1)
-        )
+        successor = _INTERLAYER_PROVIDERS.get((device_index, prefix, layer_index + 1))
         if successor is not None:
             successor._schedule_lookahead()
 
@@ -1146,25 +1559,31 @@ class CachedWeightProvider:
             mapping_host[expert_id] = slot
 
         with torch.cuda.stream(pool.copy_stream):
+            self._wait_for_exclusive_host_updates(pool.copy_stream)
             pool.copy_stream.wait_event(pool.consumed[bank_index])
             for slot, expert_id in enumerate(expert_ids):
                 result.w1[slot].copy_(
-                    self._cpu_w13[expert_id], non_blocking=True
+                    self._cpu_expert_row(self._cpu_w13, expert_id),
+                    non_blocking=True,
                 )
                 result.w2[slot].copy_(
-                    self._cpu_w2[expert_id], non_blocking=True
+                    self._cpu_expert_row(self._cpu_w2, expert_id),
+                    non_blocking=True,
                 )
                 if result.w1_scale is not None:
                     assert self._cpu_w13_scale is not None
                     assert self._cpu_w2_scale is not None
                     assert result.w2_scale is not None
                     result.w1_scale[slot].copy_(
-                        self._cpu_w13_scale[expert_id], non_blocking=True
+                        self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                        non_blocking=True,
                     )
                     result.w2_scale[slot].copy_(
-                        self._cpu_w2_scale[expert_id], non_blocking=True
+                        self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                        non_blocking=True,
                     )
             result.expert_map.copy_(mapping_host, non_blocking=True)
+            self._record_exclusive_host_reads(pool.copy_stream)
             pool.ready[bank_index].record(pool.copy_stream)
         self._lookahead_pending_ids = expert_ids
 
@@ -1177,9 +1596,7 @@ class CachedWeightProvider:
             return None
         used = set(unique_ids)
         actual = [
-            expert_id
-            for expert_id in self._lookahead_pending_ids
-            if expert_id in used
+            expert_id for expert_id in self._lookahead_pending_ids if expert_id in used
         ]
         if not actual:
             self._lookahead_pending_ids = []
@@ -1213,9 +1630,7 @@ class CachedWeightProvider:
         assert self._cpu_w2_scale is not None
 
         bank_index = self._mapped_scale_cursor
-        self._mapped_scale_cursor = (bank_index + 1) % len(
-            self._mapped_scale_aliases
-        )
+        self._mapped_scale_cursor = (bank_index + 1) % len(self._mapped_scale_aliases)
         if self._mapped_scale_in_use[bank_index]:
             event = self._mapped_scale_events[bank_index]
             if not event.query():
@@ -1372,20 +1787,30 @@ class CachedWeightProvider:
             # event; the events are initialized as reusable when the pool is
             # created.
             pool.copy_stream.wait_event(pool.consumed[bank_index])
+            self._wait_for_exclusive_host_updates(pool.copy_stream)
             for slot, expert_id in enumerate(unique_ids):
-                result.w1[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
-                result.w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+                result.w1[slot].copy_(
+                    self._cpu_expert_row(self._cpu_w13, expert_id),
+                    non_blocking=True,
+                )
+                result.w2[slot].copy_(
+                    self._cpu_expert_row(self._cpu_w2, expert_id),
+                    non_blocking=True,
+                )
                 if result.w1_scale is not None:
                     assert self._cpu_w13_scale is not None
                     assert self._cpu_w2_scale is not None
                     assert result.w2_scale is not None
                     result.w1_scale[slot].copy_(
-                        self._cpu_w13_scale[expert_id], non_blocking=True
+                        self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                        non_blocking=True,
                     )
                     result.w2_scale[slot].copy_(
-                        self._cpu_w2_scale[expert_id], non_blocking=True
+                        self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                        non_blocking=True,
                     )
             result.expert_map.copy_(mapping_host, non_blocking=True)
+            self._record_exclusive_host_reads(pool.copy_stream)
             pool.ready[bank_index].record(pool.copy_stream)
 
         if wait_for_ready:
@@ -1401,9 +1826,9 @@ class CachedWeightProvider:
         if pool is None:
             raise RuntimeError("asynchronous expert staging is not enabled")
         bank_index = group_index % 2
-        torch.cuda.current_stream(
-            device=pool.banks[bank_index].w1.device
-        ).wait_event(pool.ready[bank_index])
+        current_platform.current_stream(pool.banks[bank_index].w1.device).wait_event(
+            pool.ready[bank_index]
+        )
 
     @eager_break_during_capture
     @torch.compiler.disable
@@ -1522,7 +1947,8 @@ class CachedWeightProvider:
 
         # The common case only needs the distinct ids, which the device can
         # reduce far more cheaply than transferring every row.
-        unique = topk_ids.unique()
+        valid_ids = topk_ids[(topk_ids >= 0) & (topk_ids < self._num_experts)]
+        unique = valid_ids.unique()
         if unique.numel() <= self.capacity:
             return [(slice(0, num_rows), unique.tolist())]
 
@@ -1531,7 +1957,9 @@ class CachedWeightProvider:
         start = 0
         seen: set[int] = set()
         for i, row in enumerate(rows):
-            row_ids = set(row)
+            row_ids = {
+                expert_id for expert_id in row if 0 <= expert_id < self._num_experts
+            }
             if len(seen | row_ids) > self.capacity:
                 if i == start:
                     raise RuntimeError(
@@ -1594,9 +2022,7 @@ class CachedWeightProvider:
             # the arm file keeps those warmups out of this diagnostic, retain
             # the same validity rule as the MoE router so instrumentation can
             # never make an otherwise-valid forward fail.
-            valid_ids = flat_ids[
-                (flat_ids >= 0) & (flat_ids < self._num_experts)
-            ]
+            valid_ids = flat_ids[(flat_ids >= 0) & (flat_ids < self._num_experts)]
             counts = torch.bincount(
                 valid_ids.to(torch.int64), minlength=self._num_experts
             ).cpu()
@@ -1610,9 +2036,7 @@ class CachedWeightProvider:
             coverage = {}
             for resident_count in (8, 16, 32, 48, 64, 96, 128):
                 covered = sum(count for _, count in used[:resident_count])
-                coverage[resident_count] = (
-                    covered / total_pairs if total_pairs else 0.0
-                )
+                coverage[resident_count] = covered / total_pairs if total_pairs else 0.0
             rare = {
                 threshold: sum(1 for _, count in used if count <= threshold)
                 for threshold in (1, 2, 4, 8, 16)
@@ -1634,6 +2058,9 @@ class CachedWeightProvider:
             return self._bulk_prefill_groups
 
         unique = topk_ids.unique().tolist() if unique_ids is None else unique_ids
+        unique = [
+            expert_id for expert_id in unique if 0 <= expert_id < self._num_experts
+        ]
         if excluded_ids:
             unique = [
                 expert_id for expert_id in unique if expert_id not in excluded_ids
@@ -1686,6 +2113,9 @@ class CachedWeightProvider:
         """
         if unique_ids is None:
             unique_ids = topk_ids.unique().tolist()
+        unique_ids = [
+            expert_id for expert_id in unique_ids if 0 <= expert_id < self._num_experts
+        ]
         if len(unique_ids) > self.capacity:
             raise RuntimeError(
                 f"CachedWeightProvider: {len(unique_ids)} unique experts "
@@ -1703,6 +2133,7 @@ class CachedWeightProvider:
         needed = set(unique_ids)
 
         misses_to_copy: list[tuple[int, int]] = []
+        exclusive_swaps: list[tuple[int, int, int, int]] = []
         for expert_id in unique_ids:
             if expert_id in self._lru:
                 # Cache hit: update frequency and recency
@@ -1714,6 +2145,10 @@ class CachedWeightProvider:
             else:
                 # Cache miss: need to load expert
                 if self._free_slots:
+                    if self.exclusive:
+                        raise RuntimeError(
+                            "exclusive expert cache unexpectedly has a free slot"
+                        )
                     slot = self._free_slots.pop()
                 else:
                     # Evict entry with lowest freq/age score
@@ -1731,12 +2166,21 @@ class CachedWeightProvider:
                     # one cached expert is outside `needed` whenever the buffer
                     # is full and a miss remains to be served.
                     assert best_key is not None
-                    slot = self._lru.pop(best_key)[0]
+                    victim_id = best_key
+                    victim_slot = self._lru.pop(best_key)[0]
+                    if self.exclusive:
+                        slot, swap = self._plan_exclusive_swap(
+                            expert_id, victim_id, victim_slot
+                        )
+                        exclusive_swaps.append(swap)
+                    else:
+                        slot = victim_slot
 
                 self._clock += 1
                 self._lru[expert_id] = [slot, 1, self._clock]
                 self.misses += 1
-                misses_to_copy.append((slot, expert_id))
+                if not self.exclusive:
+                    misses_to_copy.append((slot, expert_id))
 
         result_w13_scale = self._buf_w13_scale
         result_w2_scale = self._buf_w2_scale
@@ -1745,6 +2189,12 @@ class CachedWeightProvider:
             result_w13_scale, result_w2_scale, mapped_scale_bank = (
                 self._prepare_mapped_scale_bank(unique_ids)
             )
+
+        if exclusive_swaps:
+            self._queue_exclusive_swap_wave(exclusive_swaps)
+            h2d_done = self._exclusive_h2d_done
+            assert h2d_done is not None
+            current_platform.current_stream(self._buf_w13.device).wait_event(h2d_done)
 
         if (
             self._batched_copy_function is not None
@@ -1788,6 +2238,7 @@ class CachedWeightProvider:
             mapped_scale_bank=mapped_scale_bank,
         )
 
+
 _INTERLAYER_PROVIDERS: dict[tuple[int, str, int], CachedWeightProvider] = {}
 
 
@@ -1813,6 +2264,7 @@ def run_with_expert_cache(
     When everything fits -- the common case for both splits -- ``run`` is
     called exactly once and its result returned untouched.
     """
+
     def run_and_release(
         result: ExpertWeightResult, rows: slice, include_shared: bool
     ) -> torch.Tensor:
@@ -1847,9 +2299,7 @@ def run_with_expert_cache(
             excluded_ids=set(lookahead_ids),
         )
         borrowed_ids = {
-            expert_id
-            for _, group in borrowed_groups
-            for expert_id in group
+            expert_id for _, group in borrowed_groups for expert_id in group
         }
         # Keep the policy fixed for the whole forward. Borrowed-bank planning
         # intentionally invalidates duplicate primary entries, so snapshot
@@ -1876,14 +2326,11 @@ def run_with_expert_cache(
             )
 
         execution_groups: list[tuple[str, int | None, list[int]]] = [
-            ("borrowed", bank_index, group)
-            for bank_index, group in borrowed_groups
+            ("borrowed", bank_index, group) for bank_index, group in borrowed_groups
         ]
         if lookahead is not None:
             execution_groups.append(("lookahead", None, lookahead_ids))
-        execution_groups.extend(
-            ("primary", None, group) for group in groups if group
-        )
+        execution_groups.extend(("primary", None, group) for group in groups if group)
 
         # Launch the first true-miss upload before enqueueing the resident
         # groups. Deferring only its ready-event wait gives the copy stream the
@@ -1908,9 +2355,7 @@ def run_with_expert_cache(
         staged_group_index = 0
         for i, (kind, borrowed_bank, expert_ids) in enumerate(execution_groups):
             resident = kind != "primary" or provider.group_is_resident(expert_ids)
-            staged = (
-                async_staging_ready and not bulk_prefill and not resident
-            )
+            staged = async_staging_ready and not bulk_prefill and not resident
             result = (
                 provider.prepare_borrowed_group(expert_ids, borrowed_bank)
                 if kind == "borrowed" and borrowed_bank is not None
@@ -1939,6 +2384,8 @@ def run_with_expert_cache(
             if staged and i == prestaged_execution_index:
                 assert prestaged_result is not None
                 provider.wait_staged_group(staged_group_index)
+            if result is None:
+                raise RuntimeError("pre-staged expert weights were not prepared")
             part = run_and_release(result, _ALL_ROWS, i == 0)
             if kind == "lookahead":
                 provider.release_lookahead_group()
@@ -1956,9 +2403,7 @@ def run_with_expert_cache(
     if len(plan) == 1:
         rows, unique_ids = plan[0]
         return finish_forward(
-            run_and_release(
-                provider.prepare(topk_ids, unique_ids), rows, True
-            )
+            run_and_release(provider.prepare(topk_ids, unique_ids), rows, True)
         )
     return finish_forward(
         torch.cat(

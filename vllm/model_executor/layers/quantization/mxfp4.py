@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     ExpertWeightResult,
+    file_backed_host_empty,
     registered_host_empty,
     run_with_expert_cache,
     write_combined_host_empty,
@@ -609,12 +610,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.hidden_size = hidden_size
 
         expert_weights_on_cpu = getattr(layer, "_moe_expert_cache_size", 0) > 0
+        exclusive_cache = getattr(layer, "_moe_expert_cache_exclusive", False)
+        staging_dir = getattr(layer, "_moe_expert_cache_staging_dir", None)
 
         def _empty_expert_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-            if expert_weights_on_cpu:
-                return torch.empty(
-                    *shape, dtype=dtype, device="cpu", pin_memory=True
+            if exclusive_cache:
+                return file_backed_host_empty(
+                    *shape,
+                    dtype=dtype,
+                    staging_dir=staging_dir,
                 )
+            if expert_weights_on_cpu:
+                return torch.empty(*shape, dtype=dtype, device="cpu", pin_memory=True)
             return torch.empty(*shape, dtype=dtype)
 
         # Fused gate_up_proj (column parallel)
@@ -713,17 +720,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             prepare_moe_mxfp4_layer_for_marlin,
         )
 
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = torch.device("cuda", torch.accelerator.current_device_index())
         source_tensors = (w13, w2, w13_scale, w2_scale)
         assert all(tensor.device.type in ("cpu", "cuda") for tensor in source_tensors)
         num_experts = w13.shape[0]
         batch_size = min(32, num_experts)
         outputs: list[torch.Tensor | None] = [None, None, None, None]
+        exclusive_cache = getattr(layer, "_moe_expert_cache_exclusive", False)
+        staging_dir = getattr(layer, "_moe_expert_cache_staging_dir", None)
         write_combined_backing = (
-            os.environ.get(
-                "VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED_BACKING", "0"
-            )
-            == "1"
+            os.environ.get("VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED_BACKING", "0") == "1"
         )
         # Write-combined pages are intentionally optimized for CPU writes and
         # GPU reads; direct GPU writes into them are pathologically slow on
@@ -759,7 +765,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output = outputs[index]
                 if output is None:
                     shape = (num_experts, *tensor.shape[1:])
-                    if write_combined_backing:
+                    if exclusive_cache:
+                        output = file_backed_host_empty(
+                            *shape,
+                            dtype=tensor.dtype,
+                            staging_dir=staging_dir,
+                        )
+                    elif write_combined_backing:
                         allocation_started = time.perf_counter()
                         output = write_combined_host_empty(
                             *shape,
@@ -769,9 +781,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             time.perf_counter() - allocation_started
                         )
                     elif (
-                        os.environ.get(
-                            "VLLM_MOE_EXPERT_CACHE_REGISTERED_BACKING", "0"
-                        )
+                        os.environ.get("VLLM_MOE_EXPERT_CACHE_REGISTERED_BACKING", "0")
                         == "1"
                     ):
                         output = registered_host_empty(
@@ -786,7 +796,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             pin_memory=True,
                         )
                     outputs[index] = output
-                if write_combined_backing:
+                if write_combined_backing or exclusive_cache:
                     staging = repack_staging[index]
                     if staging is None:
                         staging = torch.empty(
@@ -800,9 +810,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     staging_view = staging[: tensor.size(0)]
                     gpu_repack_started = time.perf_counter()
                     staging_view.copy_(tensor, non_blocking=False)
-                    wc_gpu_repack_seconds += (
-                        time.perf_counter() - gpu_repack_started
-                    )
+                    wc_gpu_repack_seconds += time.perf_counter() - gpu_repack_started
                     cpu_fill_started = time.perf_counter()
                     output[start:stop].copy_(staging_view)
                     wc_cpu_fill_seconds += time.perf_counter() - cpu_fill_started
@@ -910,9 +918,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             if w13_bias is not None or w2_bias is not None:
                 raise ValueError("MXFP4 expert caching does not support MoE bias.")
-            self._setup_cached_marlin_kernel(
-                layer, w13, w2, w13_scale, w2_scale
-            )
+            self._setup_cached_marlin_kernel(layer, w13, w2, w13_scale, w2_scale)
             return
 
         # Convert weights to kernel format
@@ -1130,9 +1136,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_ids=topk_ids[rows],
                     activation=layer.activation,
                     global_num_experts=layer.global_num_experts,
-                    apply_router_weight_on_input=(
-                        layer.apply_router_weight_on_input
-                    ),
+                    apply_router_weight_on_input=(layer.apply_router_weight_on_input),
                     expert_map=result.expert_map,
                     shared_experts=shared_experts if include_shared else None,
                     shared_experts_input=(

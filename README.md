@@ -161,6 +161,39 @@ vllm serve "$MODEL" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
+### Optional lower-RAM mode
+
+The default cache keeps CPU copies of GPU-resident experts for best speed. The
+exclusive cache removes those copies: on the tested TP4/cache-48 host, vLLM
+worker RAM fell from about 156.5 to 130.6 GiB. Prefill was unchanged;
+single-request generation fell from about 26 to 18-19 tokens/s, while aggregate
+three-request generation was about 8% lower.
+
+Build the CUDA 13 swap helper once:
+
+```bash
+mkdir -p build
+CUDA_PKG="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cu13"
+g++ -O3 -std=c++17 -shared -fPIC csrc/cache/cuda_batch_copy_shim.cpp \
+  -I"$CUDA_PKG/include" -L"$CUDA_PKG/lib" \
+  -Wl,-rpath,"$CUDA_PKG/lib" -Wl,-z,defs -Wl,-l:libcudart.so.13 \
+  -o build/cuda_exclusive_swap_shim.so
+```
+
+Then add these settings and flags to either launch recipe:
+
+```bash
+export VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY="$PWD/build/cuda_exclusive_swap_shim.so"
+export VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_REGISTERED_BACKING=1
+mkdir -p /fast/local/nvme/vllm-exclusive-staging
+
+# Add to `vllm serve`:
+--moe-expert-cache-exclusive \
+--moe-expert-cache-staging-dir /fast/local/nvme/vllm-exclusive-staging
+```
+
+Use fast local storage with roughly 140 GiB free for temporary startup staging.
+
 Both examples bind the OpenAI-compatible server to localhost. A single 200K
 request consumes most of the configured KV capacity, so the sequence limits are
 useful for ordinary workloads but do not imply several simultaneous 200K

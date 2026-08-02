@@ -146,6 +146,12 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "token" (default) reproduces the uncached output exactly;
             "expert" is much cheaper at small cache sizes but differs at
             rounding level.
+        moe_expert_cache_exclusive: Store each expert either in CPU RAM or the
+            primary GPU cache instead of mirroring GPU-resident experts in
+            both places. Saves host RAM but adds overlapped D2H writeback on
+            primary-cache misses. Experimental and disabled by default.
+        moe_expert_cache_staging_dir: Disk-backed directory for reclaimable
+            load-time expert tensors. Required with the exclusive cache.
         enforce_eager: Whether to enforce eager execution. If True, we will
             disable CUDA graph and always execute the model in eager mode.
             If False, we will use CUDA graph and eager execution in hybrid.
@@ -210,6 +216,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         offload_params: set[str] | None = None,
         moe_expert_cache_size: int = 0,
         moe_expert_cache_split: str = "token",
+        moe_expert_cache_exclusive: bool = False,
+        moe_expert_cache_staging_dir: str | None = None,
         enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
         disable_custom_all_reduce: bool = False,
@@ -328,6 +336,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             offload_params=offload_params or set(),
             moe_expert_cache_size=moe_expert_cache_size,
             moe_expert_cache_split=moe_expert_cache_split,
+            moe_expert_cache_exclusive=moe_expert_cache_exclusive,
+            moe_expert_cache_staging_dir=moe_expert_cache_staging_dir,
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
             disable_custom_all_reduce=disable_custom_all_reduce,

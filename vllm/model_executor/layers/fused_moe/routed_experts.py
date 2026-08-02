@@ -184,6 +184,8 @@ class RoutedExperts(PluggableLayer):
         offload_config = get_current_vllm_config().offload_config
         self._moe_expert_cache_size = offload_config.moe_expert_cache_size
         self._moe_expert_cache_split = offload_config.moe_expert_cache_split
+        self._moe_expert_cache_exclusive = offload_config.moe_expert_cache_exclusive
+        self._moe_expert_cache_staging_dir = offload_config.moe_expert_cache_staging_dir
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
@@ -197,6 +199,12 @@ class RoutedExperts(PluggableLayer):
         # effective capacity, which is what the cache is actually built with.
         top_k = self.moe_config.experts_per_token
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
+        if self._moe_expert_cache_exclusive and capacity >= self.local_num_experts:
+            raise ValueError(
+                "--moe-expert-cache-exclusive requires a cache smaller than "
+                f"the local expert count ({self.local_num_experts}); otherwise "
+                "there is no CPU backing store to compact."
+            )
         if capacity < top_k:
             raise ValueError(
                 f"moe_expert_cache_size={self._moe_expert_cache_size} gives a "
@@ -302,6 +310,7 @@ class RoutedExperts(PluggableLayer):
             w2_scale=w2_scale,
             split=self._moe_expert_cache_split,
             name=self.layer_name,
+            exclusive=self._moe_expert_cache_exclusive,
         )
         self.expert_weight_provider = provider
 

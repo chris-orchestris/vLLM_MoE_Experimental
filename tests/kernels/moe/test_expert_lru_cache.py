@@ -8,6 +8,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
     ExpertWeightResult,
+    file_backed_host_empty,
     run_with_expert_cache,
 )
 from vllm.platforms import current_platform
@@ -43,6 +44,7 @@ def _make_provider(
     split: str = "token",
     async_staging: bool | None = None,
     name: str = "unnamed",
+    exclusive: bool = False,
 ):
     set_random_seed(42)
     w13, w2 = _make_weights(num_experts, dtype)
@@ -53,6 +55,7 @@ def _make_provider(
         split=split,
         async_staging=async_staging,
         name=name,
+        exclusive=exclusive,
     )
     scales = None
     if with_scales:
@@ -79,15 +82,176 @@ def _attach_borrowed_bank(
 # -- Core cache behavior --
 
 
-def test_borrowed_bank_adds_disjoint_residency():
+def _assert_exclusive_ownership(provider: CachedWeightProvider) -> None:
+    gpu_owned = set(provider._lru)
+    cpu_owned = {
+        expert_id
+        for expert_id, slot in enumerate(provider._exclusive_host_slots)
+        if slot >= 0
+    }
+    assert gpu_owned.isdisjoint(cpu_owned)
+    assert gpu_owned | cpu_owned == set(range(provider._num_experts))
+    assert len(gpu_owned) == provider.capacity
+    assert len(cpu_owned) == provider._num_experts - provider.capacity
+    assert provider._exclusive_host_experts.count(-1) == 1
+
+
+def test_exclusive_staging_is_file_backed_and_automatically_unlinked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_STAGING_DIR", str(tmp_path))
+
+    tensor = file_backed_host_empty(4, 8, dtype=torch.uint8)
+    tensor.fill_(17)
+
+    assert tensor.tolist() == [[17] * 8] * 4
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_inclusive_cache_keeps_capacity_sized_gpu_buffers():
+    provider, *_ = _make_provider(num_experts=8, capacity=4)
+
+    assert provider.buf_w13.size(0) == 4
+    assert provider.buf_w2.size(0) == 4
+    assert provider._lru == {}
+
+
+def test_exclusive_cache_initial_partition_is_compact():
+    provider, w13, w2, _ = _make_provider(num_experts=8, capacity=4, exclusive=True)
+    torch.accelerator.synchronize()
+
+    assert provider.buf_w13.size(0) == 5
+    assert provider.buf_w2.size(0) == 5
+    assert provider._cpu_w13.size(0) == 5
+    assert provider._cpu_w2.size(0) == 5
+    assert set(provider._lru) == {0, 1, 2, 3}
+    torch.testing.assert_close(provider.buf_w13[:4].cpu(), w13[:4])
+    torch.testing.assert_close(provider.buf_w2[:4].cpu(), w2[:4])
+    torch.testing.assert_close(provider._cpu_w13[:4], w13[4:])
+    torch.testing.assert_close(provider._cpu_w2[:4], w2[4:])
+    _assert_exclusive_ownership(provider)
+
+
+def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales():
+    provider, w13, w2, scales = _make_provider(
+        num_experts=8,
+        capacity=4,
+        with_scales=True,
+        exclusive=True,
+    )
+    assert scales is not None
+    w13_scale, w2_scale = scales
+
+    result = provider.prepare(_topk([4, 5]), [4, 5])
+    torch.accelerator.synchronize()
+    for expert_id in (4, 5):
+        slot = provider._lru[expert_id][0]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+        assert result.w1_scale is not None
+        assert result.w2_scale is not None
+        torch.testing.assert_close(result.w1_scale[slot].cpu(), w13_scale[expert_id])
+        torch.testing.assert_close(result.w2_scale[slot].cpu(), w2_scale[expert_id])
+
+    # Experts 0 and 1 were the deterministic cold-cache LFRU victims and now
+    # exist only in the compact host backing.
+    for expert_id in (0, 1):
+        torch.testing.assert_close(
+            provider._cpu_expert_row(provider._cpu_w13, expert_id),
+            w13[expert_id],
+        )
+        torch.testing.assert_close(
+            provider._cpu_expert_row(provider._cpu_w2, expert_id),
+            w2[expert_id],
+        )
+    _assert_exclusive_ownership(provider)
+
+    # Swap the victims back through rotated spares. This catches stale-event,
+    # pointer-stride, and ownership-map errors that a one-way test misses.
+    result = provider.prepare(_topk([0, 1]), [0, 1])
+    torch.accelerator.synchronize()
+    for expert_id in (0, 1):
+        slot = provider._lru[expert_id][0]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+    _assert_exclusive_ownership(provider)
+
+
+def test_exclusive_cache_submits_one_native_wave_per_prepare():
     provider, w13, w2, _ = _make_provider(
-        num_experts=8, capacity=4, split="expert"
+        num_experts=8,
+        capacity=4,
+        exclusive=True,
+    )
+    native_function = provider._exclusive_swap_function
+    assert native_function is not None
+    observed_waves: list[tuple[int, int]] = []
+
+    def record_wave(*args):
+        observed_waves.append((args[5], args[6]))
+        return native_function(*args)
+
+    provider._exclusive_swap_function = record_wave
+    result = provider.prepare(_topk([4, 5, 6]), [4, 5, 6])
+    torch.accelerator.synchronize()
+
+    assert observed_waves == [(3, 2)]
+    for expert_id in (4, 5, 6):
+        slot = provider._lru[expert_id][0]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+    _assert_exclusive_ownership(provider)
+
+
+def test_exclusive_cache_ignores_profile_sentinel_expert_ids():
+    provider, w13, w2, _ = _make_provider(num_experts=8, capacity=4, exclusive=True)
+
+    all_sentinel = torch.full((2, 6), -1, dtype=torch.int32, device="cuda")
+    result = provider.prepare(all_sentinel)
+    torch.accelerator.synchronize()
+    assert set(provider._lru) == {0, 1, 2, 3}
+    assert torch.count_nonzero(result.expert_map >= 0).item() == 0
+
+    mixed = torch.tensor([[-1, 4, -1]], dtype=torch.int32, device="cuda")
+    result = provider.prepare(mixed)
+    torch.accelerator.synchronize()
+    assert -1 not in provider._lru
+    slot = provider._lru[4][0]
+    torch.testing.assert_close(result.w1[slot].cpu(), w13[4])
+    torch.testing.assert_close(result.w2[slot].cpu(), w2[4])
+    assert provider.plan_chunks(mixed) == [(slice(0, 1), [4])]
+    _assert_exclusive_ownership(provider)
+
+
+def test_exclusive_borrowed_planner_never_invalidates_primary_residents():
+    provider, *_ = _make_provider(
+        num_experts=8, capacity=4, split="expert", exclusive=True
     )
     _attach_borrowed_bank(provider, capacity=2)
+    topk_ids = _topk(list(range(8)))
+    unique_ids = topk_ids.unique().tolist()
 
-    topk_ids = torch.tensor(
-        [[0, 1, 2, 3, 4, 5]], dtype=torch.int32, device="cuda"
-    )
+    borrowed = provider.plan_borrowed_group(topk_ids, unique_ids)
+    assert borrowed == [4, 5]
+    assert set(borrowed).isdisjoint(provider._lru)
+    provider.prepare_borrowed_group(borrowed)
+
+    # Decode promotes a borrowed expert into the primary cache. The next
+    # borrowed plan retires that duplicate and selects only CPU-owned experts.
+    provider.prepare(_topk([4]), [4])
+    borrowed = provider.plan_borrowed_group(topk_ids, unique_ids)
+    assert 4 not in provider._borrowed_slots
+    assert set(borrowed).isdisjoint(provider._lru)
+    with pytest.raises(RuntimeError, match="must be exchanged"):
+        provider.invalidate(next(iter(provider._lru)))
+
+
+def test_borrowed_bank_adds_disjoint_residency():
+    provider, w13, w2, _ = _make_provider(num_experts=8, capacity=4, split="expert")
+    _attach_borrowed_bank(provider, capacity=2)
+
+    topk_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int32, device="cuda")
     unique_ids = topk_ids.unique().tolist()
     borrowed = provider.plan_borrowed_group(topk_ids, unique_ids)
     primary_groups = provider.plan_expert_groups(
@@ -421,9 +585,7 @@ def test_groups_schedule_resident_experts_first():
     provider, *_ = _make_provider(num_experts=8, capacity=2, split="expert")
     provider.prepare(_rows([[6, 7]]))
 
-    groups = provider.plan_expert_groups(
-        _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
-    )
+    groups = provider.plan_expert_groups(_rows([[0, 1], [2, 3], [4, 5], [6, 7]]))
 
     assert groups[0] == [6, 7]
     assert sorted(expert for group in groups for expert in group) == list(range(8))
@@ -498,9 +660,7 @@ def test_async_staging_capacity_is_independent_of_primary_cache(monkeypatch):
     )
     provider.prepare(_rows([[4, 5, 6, 7]]))
 
-    groups = provider.plan_expert_groups(
-        _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
-    )
+    groups = provider.plan_expert_groups(_rows([[0, 1], [2, 3], [4, 5], [6, 7]]))
 
     assert groups == [[4, 5, 6, 7], [0, 1], [2, 3]]
     assert provider.capacity == 4
@@ -566,9 +726,7 @@ def test_async_staging_launches_first_miss_before_resident_compute(monkeypatch):
     monkeypatch.setattr(provider, "prepare_staged_group", record_prepare)
 
     def run(result, rows, include_shared):
-        events.append(
-            "run:resident" if result.w1 is provider.buf_w13 else "run:staged"
-        )
+        events.append("run:resident" if result.w1 is provider.buf_w13 else "run:staged")
         return torch.zeros(topk.size(0), 4, device="cuda")
 
     run_with_expert_cache(provider, topk, run)
@@ -582,9 +740,7 @@ def test_interlayer_prefetch_uses_third_shared_bank(monkeypatch):
     """A predecessor hides one predicted successor upload in a bounded bank."""
     monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
     monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "1")
-    monkeypatch.setenv(
-        "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1"
-    )
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1")
     first, *_ = _make_provider(
         num_experts=8,
         capacity=4,
@@ -600,9 +756,7 @@ def test_interlayer_prefetch_uses_third_shared_bank(monkeypatch):
         name="model.layers.1.ffn.experts",
     )
     second.prepare(_rows([[6, 7]]))
-    second.remember_prefill_route(
-        _rows([[0, 0], [0, 1], [1, 2], [2, 3]])
-    )
+    second.remember_prefill_route(_rows([[0, 0], [0, 1], [1, 2], [2, 3]]))
 
     first.prefetch_successor(num_tokens=4)
 
@@ -643,9 +797,7 @@ def test_interlayer_prefetch_partitions_forward_exactly_once(monkeypatch):
     """Lookahead, resident, and staged groups remain disjoint and complete."""
     monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
     monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "1")
-    monkeypatch.setenv(
-        "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1"
-    )
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1")
     first, *_ = _make_provider(
         num_experts=8,
         capacity=4,
@@ -661,9 +813,7 @@ def test_interlayer_prefetch_partitions_forward_exactly_once(monkeypatch):
         name="partition.layers.1.ffn.experts",
     )
     second.prepare(_rows([[6, 7]]))
-    second.remember_prefill_route(
-        _rows([[0, 0], [0, 1], [1, 2], [2, 3]])
-    )
+    second.remember_prefill_route(_rows([[0, 0], [0, 1], [1, 2], [2, 3]]))
     first.prefetch_successor(num_tokens=4)
     topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
     exposed_groups: list[list[int]] = []

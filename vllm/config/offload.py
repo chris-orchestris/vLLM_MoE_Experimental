@@ -109,9 +109,34 @@ class OffloadConfig:
       model dtype before being summed, so results differ from the uncached
       path at rounding level."""
 
+    moe_expert_cache_exclusive: bool = False
+    """Store each expert in exactly one primary location: either the CPU
+    backing store or the GPU expert cache. On eviction, the outgoing GPU expert
+    is written back while the incoming CPU expert is uploaded on independent
+    copy engines. This reduces host RAM by approximately the GPU cache's share
+    of the expert weights at the cost of bidirectional PCIe traffic on misses.
+    Experimental and disabled by default."""
+
+    moe_expert_cache_staging_dir: str | None = None
+    """Disk-backed directory used for reclaimable load-time expert staging.
+    Required by exclusive expert caching so startup does not materialize the
+    full checkpoint and runtime expert layouts in pinned RAM simultaneously."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        if self.moe_expert_cache_exclusive and self.moe_expert_cache_size == 0:
+            raise ValueError(
+                "moe_expert_cache_exclusive requires moe_expert_cache_size > 0"
+            )
+        if (
+            self.moe_expert_cache_exclusive
+            and self.moe_expert_cache_staging_dir is None
+        ):
+            raise ValueError(
+                "moe_expert_cache_exclusive requires "
+                "moe_expert_cache_staging_dir on a disk-backed filesystem"
+            )
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
