@@ -1,4 +1,176 @@
 <!-- markdownlint-disable MD001 MD041 -->
+# vLLM MoE Experimental
+
+> [!WARNING]
+> This is an experimental Linux/NVIDIA fork of vLLM, not an official vLLM or
+> DeepSeek release. It is intended for testing
+> [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
+> on consumer Ampere GPUs with CPU RAM backing the model's 4-bit MoE experts.
+> Expect rough edges, changing interfaces, and limited hardware validation.
+
+The current target is a practical **200K-token context** on RTX 3090 systems
+that cannot hold the full checkpoint in VRAM. Expert GEMMs still execute on the
+GPUs: CPU RAM is the pinned backing store, while a bounded per-layer GPU cache
+keeps active experts resident and asynchronously stages cache misses.
+
+## What this fork adds
+
+- A DeepSeek V4 SM8x backend, including Ampere sparse-MLA/indexer kernels and a
+  fused MHC path. Only RTX 3090 / SM86 has been exercised extensively.
+- Native 4-bit/MXFP4 MoE expert execution through Marlin without requantizing
+  the model.
+- Pinned-RAM expert backing, a bounded GPU LFRU expert cache, asynchronous H2D
+  miss staging, and inter-layer route lookahead.
+- DeepSeek V4 DSpark MTP speculative decoding with five speculative tokens.
+- Piecewise CUDA graph support around the dynamic expert-cache path.
+- Experimental adaptive KV-tail lending and host-staged TP all-reduce paths.
+  These advanced paths are deliberately not enabled in the basic recipes below.
+
+## Tested scope
+
+- Linux x86-64, Python 3.12, CUDA 13, and RTX 3090 GPUs.
+- The exact `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint only.
+- 4-GPU + RAM and 2-GPU + RAM tensor-parallel configurations.
+- Up to 200,000 tokens of configured context with FP8 KV cache.
+
+Allow roughly 160 GiB for the downloaded checkpoint. A machine with 256 GiB of
+system RAM is recommended so model loading, pinned expert storage, and the OS
+have adequate headroom.
+
+## Install
+
+Install [`uv`](https://docs.astral.sh/uv/), use a recent NVIDIA driver that
+supports CUDA 13, and then:
+
+```bash
+git clone https://github.com/chris-orchestris/vLLM_MoE_Experimental.git
+cd vLLM_MoE_Experimental
+
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+
+VLLM_USE_PRECOMPILED=1 \
+VLLM_PRECOMPILED_WHEEL_COMMIT=nightly \
+VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
+uv pip install --editable . --torch-backend=auto
+```
+
+The precompiled nightly supplies vLLM's compiled base extensions; this checkout
+overlays the experimental Python and Triton code. The optional native
+host-all-reduce helpers under `csrc/host_all_reduce/` are not required by these
+quick-start profiles.
+
+## Common launch settings
+
+Set `MODEL` to the already-downloaded Hugging Face snapshot or model directory:
+
+```bash
+export MODEL=/path/to/DeepSeek-V4-Flash-0731
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+export VLLM_DSV4_AMPERE_FUSED_MHC=1
+export VLLM_SM86_SINK=1
+export VLLM_USE_DEEP_GEMM=0
+export VLLM_MOE_USE_DEEP_GEMM=0
+export VLLM_USE_DEEP_GEMM_E8M0=0
+export VLLM_USE_FLASHINFER_SAMPLER=0
+export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING=1
+export VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH=1
+export VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS=512
+```
+
+### 4x RTX 3090 + CPU RAM
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=32
+
+vllm serve "$MODEL" \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --load-format safetensors \
+  --dtype bfloat16 \
+  --max-model-len 200000 \
+  --tensor-parallel-size 4 \
+  --distributed-executor-backend mp \
+  --gpu-memory-utilization 0.98 \
+  --kv-cache-memory-bytes 6777995264 \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --moe-expert-cache-size 48 \
+  --moe-expert-cache-split expert \
+  --moe-backend marlin \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 6528 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --disable-custom-all-reduce \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":24}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+```
+
+### 2x RTX 3090 + CPU RAM
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=20
+
+vllm serve "$MODEL" \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --trust-remote-code \
+  --load-format safetensors \
+  --dtype bfloat16 \
+  --max-model-len 200000 \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend mp \
+  --gpu-memory-utilization 0.98 \
+  --kv-cache-memory-bytes 5100273664 \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --moe-expert-cache-size 20 \
+  --moe-expert-cache-split expert \
+  --moe-backend marlin \
+  --max-num-seqs 2 \
+  --max-num-batched-tokens 4096 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --tokenizer-mode deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --disable-custom-all-reduce \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":12}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+```
+
+Both examples bind the OpenAI-compatible server to localhost. A single 200K
+request consumes most of the configured KV capacity, so the sequence limits are
+useful for ordinary workloads but do not imply several simultaneous 200K
+requests. First startup is slow because vLLM must load the checkpoint, allocate
+pinned expert storage, and compile/cache kernels.
+
+## Reference performance
+
+On the tested 3090 host, the fully tuned TP4 profile reached roughly
+1,380-1,470 prompt tokens/s on a 5.8K-token prompt, 24-27 generation tokens/s,
+and about 491 prompt tokens/s at 195.6K tokens. The TP2 profile reached roughly
+890 prompt tokens/s and 12 generation tokens/s on the shorter workload, and
+about 432 prompt tokens/s at 195.6K tokens. These are development measurements,
+not guarantees; host memory bandwidth, CPU, drivers, and request shape matter.
+
+---
+
+## Upstream vLLM README
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
