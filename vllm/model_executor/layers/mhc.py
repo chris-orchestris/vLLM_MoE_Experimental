@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 # this import will also register the custom ops
@@ -38,9 +40,14 @@ def _is_sm8x() -> bool:
     Route ``forward_cuda`` to the portable torch/triton fallbacks instead.
     """
     return (
-        current_platform.is_cuda()
-        and current_platform.get_device_capability()[0] < 9
+        current_platform.is_cuda() and current_platform.get_device_capability()[0] < 9
     )
+
+
+@torch.compiler.assume_constant_result
+def _use_sm8x_triton_mhc() -> bool:
+    """Enable the experimental fused MHC path only by explicit opt-in."""
+    return _is_sm8x() and os.getenv("VLLM_DSV4_AMPERE_FUSED_MHC", "0") == "1"
 
 
 # --8<-- [start:mhc_pre]
@@ -74,10 +81,32 @@ class MHCPreOp(CustomOp):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if _is_sm8x():
+            if _use_sm8x_triton_mhc():
+                return mhc_kernels.mhc_pre_triton(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                )
             return self.forward_native(
-                residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
-                hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
-                n_splits, norm_weight, norm_eps,
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
             )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
@@ -231,6 +260,13 @@ class MHCPostOp(CustomOp):
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
         if _is_sm8x():
+            if _use_sm8x_triton_mhc():
+                return mhc_kernels.mhc_post_triton(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                )
             return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
@@ -451,10 +487,39 @@ class MHCFusedPostPreOp(CustomOp):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if _is_sm8x():
+            if _use_sm8x_triton_mhc():
+                return mhc_kernels.mhc_fused_post_pre_triton(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                )
             return self.forward_native(
-                x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
-                rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-                sinkhorn_repeat, n_splits, tile_n, norm_weight, norm_eps,
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
             )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,

@@ -8,6 +8,11 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
 )
+from vllm.model_executor.kernels.mhc.triton import (
+    mhc_post_triton,
+    mhc_pre_triton,
+    mhc_sinkhorn_triton,
+)
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -77,6 +82,87 @@ def mhc_post_ref(
     """mHC post reference kernel from tilelang repo: https://github.com/tile-ai/tilelang/blob/d135bd1cd2d2eee74fbb41dd0a0831a427194c86/examples/deepseek_mhc/example_mhc_post.py#L68"""
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
     return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 24, 512])
+def test_mhc_sinkhorn_triton(num_tokens):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    logits = torch.randn((num_tokens, 4, 4), dtype=torch.float32)
+    actual = mhc_sinkhorn_triton(logits, 1e-6, 20)
+    expected = sinkhorn_normalize_ref(logits, repeat=20, eps=1e-6)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 24, 512])
+def test_mhc_pre_triton(num_tokens):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    hidden_size = 4096
+    hc_mult = 4
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+
+    expected = mhc_pre_ref(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        20,
+    )
+    actual = mhc_pre_triton(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        20,
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor,
+            expected_tensor,
+            atol=5e-2,
+            rtol=1e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 24, 512])
+def test_mhc_post_triton(num_tokens):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    hidden_size = 4096
+    hc_mult = 4
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+
+    expected = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    actual = mhc_post_triton(x, residual, post_layer_mix, comb_res_mix)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=1e-2)
 
 
 def hc_head_ref(
