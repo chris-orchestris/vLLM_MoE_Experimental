@@ -1046,7 +1046,7 @@ rignore==0.7.6
     # via fastapi-cloud-cli
 rouge-score==0.1.2
     # via lm-eval
-rpds-py==0.20.1
+rpds-py==0.30.0
     # via
     #   jsonschema
     #   referencing
