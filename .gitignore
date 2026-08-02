@@ -254,3 +254,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local DeepSeek V4 optimization workspace (never publish)
+/.local-work/
+*.pre-hybrid-dcp

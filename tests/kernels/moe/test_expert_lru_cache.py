@@ -8,6 +8,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
     ExpertWeightResult,
+    run_with_expert_cache,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -41,6 +42,7 @@ def _make_provider(
     with_scales: bool = False,
     split: str = "token",
     async_staging: bool | None = None,
+    name: str = "unnamed",
 ):
     set_random_seed(42)
     w13, w2 = _make_weights(num_experts, dtype)
@@ -50,6 +52,7 @@ def _make_provider(
         w2_weight=w2,
         split=split,
         async_staging=async_staging,
+        name=name,
     )
     scales = None
     if with_scales:
@@ -63,7 +66,74 @@ def _topk(ids: list[int]) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.int32, device="cuda").unsqueeze(0)
 
 
+def _attach_borrowed_bank(
+    provider: CachedWeightProvider, capacity: int, min_tokens: int = 1
+) -> int:
+    buffers = [
+        torch.empty(shape, dtype=dtype, device="cuda")
+        for dtype, shape in provider.borrowed_tensor_specs(capacity)
+    ]
+    return provider.attach_borrowed_buffers(buffers, min_tokens=min_tokens)
+
+
 # -- Core cache behavior --
+
+
+def test_borrowed_bank_adds_disjoint_residency():
+    provider, w13, w2, _ = _make_provider(
+        num_experts=8, capacity=4, split="expert"
+    )
+    _attach_borrowed_bank(provider, capacity=2)
+
+    topk_ids = torch.tensor(
+        [[0, 1, 2, 3, 4, 5]], dtype=torch.int32, device="cuda"
+    )
+    unique_ids = topk_ids.unique().tolist()
+    borrowed = provider.plan_borrowed_group(topk_ids, unique_ids)
+    primary_groups = provider.plan_expert_groups(
+        topk_ids, unique_ids=unique_ids, excluded_ids=set(borrowed)
+    )
+
+    assert borrowed == [0, 1]
+    assert primary_groups == [[2, 3, 4, 5]]
+    borrowed_result = provider.prepare_borrowed_group(borrowed)
+    for expert_id in borrowed:
+        slot = provider._borrowed_slots[expert_id]
+        torch.testing.assert_close(borrowed_result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(borrowed_result.w2[slot].cpu(), w2[expert_id])
+
+    provider.prepare(topk_ids, primary_groups[0])
+    assert set(provider._lru).isdisjoint(provider._borrowed_slots)
+    assert len(provider._lru) + len(provider._borrowed_slots) == 6
+
+
+def test_borrowed_bank_is_one_way_disabled():
+    provider, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
+    _attach_borrowed_bank(provider, capacity=2)
+    topk_ids = _topk([0, 1, 2, 3, 4, 5])
+    unique_ids = topk_ids.unique().tolist()
+    assert provider.plan_borrowed_group(topk_ids, unique_ids)
+
+    provider.disable_borrowed_buffers()
+    assert provider.plan_borrowed_group(topk_ids, unique_ids) == []
+
+
+def test_borrowed_tiers_are_disjoint_and_independently_disabled():
+    provider, *_ = _make_provider(num_experts=8, capacity=3, split="expert")
+    base_index = _attach_borrowed_bank(provider, capacity=2)
+    burst_index = _attach_borrowed_bank(provider, capacity=2)
+    assert (base_index, burst_index) == (0, 1)
+
+    topk_ids = _topk([0, 1, 2, 3, 4, 5, 6])
+    unique_ids = topk_ids.unique().tolist()
+    groups = provider.plan_borrowed_groups(topk_ids, unique_ids)
+    assert groups == [(0, [0, 1]), (1, [2, 3])]
+    assert set(groups[0][1]).isdisjoint(groups[1][1])
+
+    provider.disable_borrowed_buffers(burst_index)
+    groups = provider.plan_borrowed_groups(topk_ids, unique_ids)
+    assert groups == [(0, [0, 1])]
+    assert provider._borrowed_enabled
 
 
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -346,6 +416,349 @@ def test_groups_partition_all_experts():
         assert len(g) <= provider.capacity
 
 
+def test_groups_schedule_resident_experts_first():
+    """Chunked prefills reuse the group retained by the prior chunk."""
+    provider, *_ = _make_provider(num_experts=8, capacity=2, split="expert")
+    provider.prepare(_rows([[6, 7]]))
+
+    groups = provider.plan_expert_groups(
+        _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    )
+
+    assert groups[0] == [6, 7]
+    assert sorted(expert for group in groups for expert in group) == list(range(8))
+
+
+def test_async_staging_uses_layer_cache_for_resident_group():
+    """The zero-copy resident group stays out of the shared staging banks."""
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    provider.prepare(_rows([[6, 7]]))
+    initial_misses = provider.misses
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    observed_buffers: list[torch.Tensor] = []
+
+    def run(result, rows, include_shared):
+        observed_buffers.append(result.w1)
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(provider, topk, run)
+
+    assert observed_buffers[0] is provider.buf_w13
+    assert all(buffer is not provider.buf_w13 for buffer in observed_buffers[1:])
+    assert provider.misses - initial_misses == 6
+    assert provider.hits == 2
+    assert set(provider._lru) == {6, 7}
+
+
+def test_async_staging_waits_for_one_normal_primary_cache_fill():
+    """The first forward populates the LRU instead of bypassing it forever."""
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    first_buffers: list[torch.Tensor] = []
+
+    def first_run(result, rows, include_shared):
+        first_buffers.append(result.w1)
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    assert not provider.async_staging_ready
+    run_with_expert_cache(provider, topk, first_run)
+    assert provider.async_staging_ready
+    assert len(provider._lru) == provider.capacity
+    assert all(buffer is provider.buf_w13 for buffer in first_buffers)
+
+    second_buffers: list[torch.Tensor] = []
+
+    def second_run(result, rows, include_shared):
+        second_buffers.append(result.w1)
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(provider, topk, second_run)
+    assert second_buffers[0] is provider.buf_w13
+    assert all(buffer is not provider.buf_w13 for buffer in second_buffers[1:])
+
+
+def test_async_staging_capacity_is_independent_of_primary_cache(monkeypatch):
+    """A smaller shared bank bounds memory without shrinking decode residency."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+    )
+    provider.prepare(_rows([[4, 5, 6, 7]]))
+
+    groups = provider.plan_expert_groups(
+        _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    )
+
+    assert groups == [[4, 5, 6, 7], [0, 1], [2, 3]]
+    assert provider.capacity == 4
+    assert provider._staging_capacity == 2
+    assert provider._staging_pool is not None
+    assert provider._staging_pool.capacity == 2
+    assert all(result.w1.size(0) == 2 for result in provider._staging_pool.banks)
+
+
+def test_async_staging_index_excludes_borrowed_and_resident_groups(monkeypatch):
+    """Only shared-bank groups advance the bounded staging-bank ordinal."""
+    provider, *_ = _make_provider(
+        num_experts=6,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    _attach_borrowed_bank(provider, capacity=1)
+    _attach_borrowed_bank(provider, capacity=1)
+    provider.prepare(_rows([[4, 5]]))
+    topk = _rows([[0, 1], [2, 3], [4, 5]])
+    observed_indices: list[int] = []
+    original_prepare = provider.prepare_staged_group
+
+    def record_prepare(expert_ids, group_index, *, wait_for_ready=True):
+        observed_indices.append(group_index)
+        return original_prepare(
+            expert_ids,
+            group_index,
+            wait_for_ready=wait_for_ready,
+        )
+
+    monkeypatch.setattr(provider, "prepare_staged_group", record_prepare)
+
+    def run(result, rows, include_shared):
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(provider, topk, run)
+    assert observed_indices == [0]
+
+
+def test_async_staging_launches_first_miss_before_resident_compute(monkeypatch):
+    """The first copy gets resident-kernel lead time before its event wait."""
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    provider.prepare(_rows([[6, 7]]))
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    events: list[str] = []
+    original_prepare = provider.prepare_staged_group
+
+    def record_prepare(expert_ids, group_index, *, wait_for_ready=True):
+        events.append(f"stage:{group_index}:{wait_for_ready}")
+        return original_prepare(
+            expert_ids,
+            group_index,
+            wait_for_ready=wait_for_ready,
+        )
+
+    monkeypatch.setattr(provider, "prepare_staged_group", record_prepare)
+
+    def run(result, rows, include_shared):
+        events.append(
+            "run:resident" if result.w1 is provider.buf_w13 else "run:staged"
+        )
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(provider, topk, run)
+
+    assert events[0] == "stage:0:False"
+    assert events[1] == "run:resident"
+    assert events[2] == "run:staged"
+
+
+def test_interlayer_prefetch_uses_third_shared_bank(monkeypatch):
+    """A predecessor hides one predicted successor upload in a bounded bank."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "1")
+    monkeypatch.setenv(
+        "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1"
+    )
+    first, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+        name="model.layers.0.ffn.experts",
+    )
+    second, second_w13, second_w2, _ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+        name="model.layers.1.ffn.experts",
+    )
+    second.prepare(_rows([[6, 7]]))
+    second.remember_prefill_route(
+        _rows([[0, 0], [0, 1], [1, 2], [2, 3]])
+    )
+
+    first.prefetch_successor(num_tokens=4)
+
+    assert second._staging_pool is first._staging_pool
+    assert second._staging_pool is not None
+    assert len(second._staging_pool.banks) == 3
+    assert second._lookahead_pending_ids == [0, 1]
+    lookahead = second.take_lookahead_group([0, 1, 4, 5])
+    assert lookahead is not None
+    expert_ids, result = lookahead
+    assert expert_ids == [0, 1]
+    second.wait_lookahead_group()
+    torch.testing.assert_close(result.w1[:2].cpu(), second_w13[[0, 1]])
+    torch.testing.assert_close(result.w2[:2].cpu(), second_w2[[0, 1]])
+    second.release_lookahead_group()
+    assert second._lookahead_pending_ids == []
+
+
+def test_borrowed_planning_honors_lookahead_exclusions():
+    """A predicted group cannot also be admitted to a KV-backed bank."""
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+    )
+    _attach_borrowed_bank(provider, capacity=2)
+
+    groups = provider.plan_borrowed_groups(
+        _rows([[0, 1], [2, 3]]),
+        [0, 1, 2, 3],
+        excluded_ids={0, 1},
+    )
+
+    assert groups == [(0, [2, 3])]
+
+
+def test_interlayer_prefetch_partitions_forward_exactly_once(monkeypatch):
+    """Lookahead, resident, and staged groups remain disjoint and complete."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "1")
+    monkeypatch.setenv(
+        "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS", "1"
+    )
+    first, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+        name="partition.layers.0.ffn.experts",
+    )
+    second, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+        name="partition.layers.1.ffn.experts",
+    )
+    second.prepare(_rows([[6, 7]]))
+    second.remember_prefill_route(
+        _rows([[0, 0], [0, 1], [1, 2], [2, 3]])
+    )
+    first.prefetch_successor(num_tokens=4)
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    exposed_groups: list[list[int]] = []
+
+    def run(result, rows, include_shared):
+        mapping = result.expert_map.cpu().tolist()
+        exposed_groups.append(
+            [expert_id for expert_id, slot in enumerate(mapping) if slot >= 0]
+        )
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(second, topk, run)
+
+    flattened = [expert_id for group in exposed_groups for expert_id in group]
+    assert sorted(flattened) == list(range(8))
+    assert len(flattened) == len(set(flattened))
+    assert second._lookahead_pending_ids == []
+
+
+def test_async_staging_survives_borrowed_bank_duplicate_invalidation():
+    """A decode-inserted borrowed expert cannot collapse the warm policy."""
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+    )
+    _attach_borrowed_bank(provider, capacity=2)
+    provider.prepare(_rows([[0, 4, 5, 6]]))
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    unique_ids = topk.unique().tolist()
+
+    borrowed = provider.plan_borrowed_groups(topk, unique_ids)
+    assert borrowed == [(0, [0, 1])]
+    assert set(provider._lru) == {4, 5, 6}
+    assert provider.async_staging_ready
+
+    groups = provider.plan_expert_groups(
+        topk,
+        unique_ids=unique_ids,
+        excluded_ids={0, 1},
+    )
+    assert groups == [[4, 5, 6], [2, 3, 7]]
+
+
+def test_bulk_prefill_uses_static_contiguous_groups(monkeypatch):
+    """Large prefills avoid inspecting routes and upload contiguous slices."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_BULK_PREFILL_MIN_TOKENS", "4")
+    provider, w13, w2, scales = _make_provider(
+        num_experts=8,
+        capacity=2,
+        with_scales=True,
+        split="expert",
+    )
+    # The routes intentionally use only two experts. Once the threshold is
+    # reached, planning is static and therefore does not need a device sync.
+    topk = _rows([[0, 1], [0, 1], [0, 1], [0, 1]])
+    assert provider.uses_bulk_prefill(topk)
+    assert provider.plan_expert_groups(topk) == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+    ]
+
+    assert scales is not None
+    for group_index, expert_ids in enumerate(provider._bulk_prefill_groups):
+        result = provider.prepare_bulk_prefill_group(group_index)
+        torch.testing.assert_close(result.w1.cpu(), w13[expert_ids])
+        torch.testing.assert_close(result.w2.cpu(), w2[expert_ids])
+        assert result.w1_scale is not None
+        assert result.w2_scale is not None
+        torch.testing.assert_close(result.w1_scale.cpu(), scales[0][expert_ids])
+        torch.testing.assert_close(result.w2_scale.cpu(), scales[1][expert_ids])
+        mapping = result.expert_map.cpu().tolist()
+        assert {
+            expert_id for expert_id, slot in enumerate(mapping) if slot >= 0
+        } == set(expert_ids)
+        for slot, expert_id in enumerate(expert_ids):
+            assert mapping[expert_id] == slot
+
+    assert set(provider._lru) == {6, 7}
+    assert provider.misses == 8
+    assert provider.hits == 0
+
+
+def test_bulk_prefill_leaves_short_forward_adaptive(monkeypatch):
+    """Decode and small prefills keep the route-aware LFRU behavior."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_BULK_PREFILL_MIN_TOKENS", "4")
+    provider, *_ = _make_provider(num_experts=8, capacity=2, split="expert")
+    topk = _rows([[3, 5]])
+    assert not provider.uses_bulk_prefill(topk)
+    assert provider.plan_expert_groups(topk) == [[3, 5]]
+
+
 def test_async_staging_double_buffers_groups_without_touching_decode_cache():
     """Staging overlaps reusable banks while preserving every group's data."""
     provider, w13, w2, scales = _make_provider(
@@ -403,6 +816,39 @@ def test_async_staging_double_buffers_groups_without_touching_decode_cache():
     assert provider.misses == 8
     assert provider.hits == 0
     assert provider._lru == {}, "prefill staging must preserve the decode cache"
+
+
+def test_async_staging_waits_before_bank_zero_reuse_across_layers():
+    """A following layer cannot overwrite bank zero while it is consumed."""
+    first, first_w13, _, _ = _make_provider(
+        num_experts=8,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    second, second_w13, _, _ = _make_provider(
+        num_experts=8,
+        capacity=2,
+        split="expert",
+        async_staging=True,
+    )
+    assert first._staging_pool is second._staging_pool
+
+    first_result = first.prepare_staged_group([0, 1], 0)
+    # Keep bank zero live long enough for an unsafe next-layer copy to race it.
+    torch.cuda._sleep(50_000_000)
+    first_sum = first_result.w1[:2].float().sum()
+    first.release_staged_group(0)
+
+    # The next layer starts its group numbering at zero and therefore reuses
+    # the same shared bank. Its copy must wait for first_sum and the release
+    # event above, despite group_index being zero.
+    second_result = second.prepare_staged_group([2, 3], 0)
+    second_sum = second_result.w1[:2].float().sum()
+    second.release_staged_group(0)
+
+    torch.testing.assert_close(first_sum.cpu(), first_w13[:2].float().sum())
+    torch.testing.assert_close(second_sum.cpu(), second_w13[2:4].float().sum())
 
 
 def test_group_count_is_independent_of_token_count():

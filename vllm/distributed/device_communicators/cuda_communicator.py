@@ -95,6 +95,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self.host_ar_comm = None
+
+        if "tp" in unique_name and self.world_size > 1:
+            from vllm.distributed.device_communicators.host_all_reduce import (
+                HostAllReduce,
+            )
+
+            self.host_ar_comm = HostAllReduce(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                rank_in_group=self.rank_in_group,
+                world_size=self.world_size,
+                global_ranks=self.ranks,
+            )
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -223,6 +237,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "AITER_CUSTOM",
             "CUSTOM",
             "SYMM_MEM",
+            "HOST_STAGED",
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
@@ -260,6 +275,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
             enabled_ar_backends.append("SYMM_MEM")
+        if self.host_ar_comm is not None and not self.host_ar_comm.disabled:
+            enabled_ar_backends.append("HOST_STAGED")
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             enabled_ar_backends.append("PYNCCL")
 
@@ -324,6 +341,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
             return out
+        host_ar_comm = self.host_ar_comm
+        if host_ar_comm is not None and host_ar_comm.should_use(input_):
+            return host_ar_comm.all_reduce(input_)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
@@ -581,6 +601,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
+        if self.host_ar_comm is not None:
+            self.host_ar_comm.destroy()
+            self.host_ar_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]

@@ -57,6 +57,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        dcp_world_size: int | None = None,
     ):
         """
         Args:
@@ -125,13 +126,27 @@ class BlockTable:
             # PCP might not be initialized in testing
             self.pcp_world_size = 1
             self.pcp_rank = 0
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
+        if dcp_world_size is None:
+            try:
+                self.dcp_world_size = get_dcp_group().world_size
+                self.dcp_rank = get_dcp_group().rank_in_group
+            except AssertionError:
+                # DCP might not be initialized in testing
+                self.dcp_world_size = 1
+                self.dcp_rank = 0
+        elif dcp_world_size == 1:
+            # Replicated cache group inside a globally DCP-sharded model.
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        else:
+            dcp_group = get_dcp_group()
+            if dcp_group.world_size != dcp_world_size:
+                raise ValueError(
+                    f"BlockTable DCP size {dcp_world_size} does not match "
+                    f"the initialized DCP group size {dcp_group.world_size}."
+                )
+            self.dcp_world_size = dcp_world_size
+            self.dcp_rank = dcp_group.rank_in_group
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self.slot_mapping_mode = slot_mapping_mode
 
@@ -281,6 +296,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        dcp_world_sizes: list[int] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -298,6 +314,17 @@ class MultiGroupBlockTable:
         if len(max_num_blocks) != len(block_sizes):
             raise ValueError(
                 f"max_num_blocks length ({len(max_num_blocks)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+
+        effective_dcp_world_sizes: list[int | None] = (
+            [None] * len(block_sizes)
+            if dcp_world_sizes is None
+            else list(dcp_world_sizes)
+        )
+        if len(effective_dcp_world_sizes) != len(block_sizes):
+            raise ValueError(
+                f"dcp_world_sizes length ({len(effective_dcp_world_sizes)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
@@ -323,14 +350,20 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                dcp_world_size=dcp_world_size,
             )
             for (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
+                dcp_world_size,
             ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                slot_mapping_modes,
+                effective_dcp_world_sizes,
             )
         ]
 

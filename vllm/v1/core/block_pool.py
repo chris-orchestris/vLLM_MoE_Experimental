@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -171,6 +172,23 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        configured_fences = {
+            int(os.getenv("DSV4_MOE_KV_TAIL_CACHE_FENCE_BLOCK", "0")),
+            int(os.getenv("DSV4_MOE_KV_TAIL_BASE_FENCE_BLOCK", "0")),
+        }
+        if any(not 0 <= fence < num_gpu_blocks for fence in configured_fences):
+            raise ValueError(
+                "KV-tail expert cache fences must be in "
+                f"[0, {num_gpu_blocks}), got {sorted(configured_fences)}"
+            )
+        self.kv_tail_expert_cache_fences = sorted(
+            fence for fence in configured_fences if fence > 0
+        )
+        self.kv_tail_expert_cache_fence = (
+            self.kv_tail_expert_cache_fences[0]
+            if self.kv_tail_expert_cache_fences
+            else 0
+        )
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -660,6 +678,24 @@ class BlockPool:
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
+        # Crossing a revocable tier makes its pages normal KV storage. Advance
+        # the recycling fence immediately so those blocks are subsequently
+        # preferred over the still-lent, higher tier. The workers observe the
+        # same allocation in SchedulerOutput and revoke the crossed bank before
+        # any KV zero/write reaches it.
+        if ret and self.kv_tail_expert_cache_fence:
+            allocation_max = max(block.block_id for block in ret)
+            while (
+                self.kv_tail_expert_cache_fences
+                and allocation_max >= self.kv_tail_expert_cache_fences[0]
+            ):
+                self.kv_tail_expert_cache_fences.pop(0)
+            self.kv_tail_expert_cache_fence = (
+                self.kv_tail_expert_cache_fences[0]
+                if self.kv_tail_expert_cache_fences
+                else 0
+            )
+
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
@@ -737,9 +773,32 @@ class BlockPool:
                 else:
                     blocks_with_hash.append(block)
 
-        # Blocks without hash get evicted first - prepend them last to the tail
-        self.free_block_queue.prepend_n(blocks_without_hash)
-        self.free_block_queue.append_n(blocks_with_hash)
+        if self.kv_tail_expert_cache_fence:
+            # While high physical IDs back the auxiliary MoE bank, recycle
+            # evictable low-ID prefixes before consuming untouched tail IDs.
+            # Hash lookup happens before allocation, so an exact prefix still
+            # hits and `touch()` removes it from this queue. Only unrelated
+            # cached prefixes lose retention. A request that genuinely needs
+            # more than the low pool still reaches the tail and makes workers
+            # disable the bank before block zeroing.
+            low_blocks_with_hash = [
+                block
+                for block in blocks_with_hash
+                if block.block_id < self.kv_tail_expert_cache_fence
+            ]
+            high_blocks_with_hash = [
+                block
+                for block in blocks_with_hash
+                if block.block_id >= self.kv_tail_expert_cache_fence
+            ]
+            self.free_block_queue.prepend_n(low_blocks_with_hash)
+            self.free_block_queue.prepend_n(blocks_without_hash)
+            self.free_block_queue.append_n(high_blocks_with_hash)
+        else:
+            # Blocks without hash get evicted first; cached blocks retain LRU
+            # eviction order at the tail.
+            self.free_block_queue.prepend_n(blocks_without_hash)
+            self.free_block_queue.append_n(blocks_with_hash)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

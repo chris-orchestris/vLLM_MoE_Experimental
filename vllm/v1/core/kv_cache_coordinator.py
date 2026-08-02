@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    get_kv_cache_spec_dcp_world_size,
 )
 from vllm.v1.request import Request
 
@@ -111,7 +112,9 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=get_kv_cache_spec_dcp_world_size(
+                    kv_cache_group.kv_cache_spec, dcp_world_size
+                ),
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
@@ -468,10 +471,12 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
-        self.dcp_world_size = dcp_world_size
+        self.dcp_world_size = get_kv_cache_spec_dcp_world_size(
+            self.kv_cache_spec, dcp_world_size
+        )
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+        if self.dcp_world_size > 1:
+            self.block_size *= self.dcp_world_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -569,13 +574,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
-            # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # DCP shards full-attention KV across ranks. Sliding-window and
+            # Mamba state groups are deliberately replicated and use an
+            # effective DCP size of one in their managers and block tables.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                assert isinstance(
+                    g.kv_cache_spec,
+                    (FullAttentionSpec, SlidingWindowSpec, MambaSpec),
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, replicated sliding-window, and Mamba "
+                    "groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Partial hash hits are limited to full-attention + mamba ("align")
@@ -771,10 +780,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=(
-                        self.dcp_world_size
-                        if isinstance(spec, FullAttentionSpec)
-                        else 1
+                    dcp_world_size=get_kv_cache_spec_dcp_world_size(
+                        spec, self.dcp_world_size
                     ),
                 )
                 if drop_eagle_block:

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
+import importlib.util
+import math
+import mmap
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,6 +19,96 @@ logger = init_logger(__name__)
 
 _STATS_LOG_INTERVAL = 64
 
+_BATCH_COPY_FUNCTIONS: dict[str, Callable[..., int]] = {}
+_REGISTERED_HOST_ALLOCATIONS: list[tuple[mmap.mmap, int, int]] = []
+_WRITE_COMBINED_HOST_ALLOCATIONS: list[tuple[ctypes.c_void_p, object]] = []
+_MAPPED_TENSOR_EXTENSION: object | None = None
+_MAPPED_TENSOR_CUDART: ctypes.CDLL | None = None
+
+
+def _mapped_cuda_alias(host_tensor: torch.Tensor) -> torch.Tensor:
+    """Create a non-owning CUDA tensor over an existing pinned CPU tensor."""
+    global _MAPPED_TENSOR_EXTENSION, _MAPPED_TENSOR_CUDART
+
+    if host_tensor.device.type != "cpu" or not host_tensor.is_pinned():
+        raise ValueError("mapped expert scales require a pinned CPU tensor")
+    if not host_tensor.is_contiguous():
+        raise ValueError("mapped expert scales require contiguous storage")
+
+    if _MAPPED_TENSOR_EXTENSION is None:
+        extension_path = os.environ.get("VLLM_MOE_MAPPED_TENSOR_LIBRARY")
+        if not extension_path:
+            raise RuntimeError(
+                "VLLM_MOE_MAPPED_TENSOR_LIBRARY must point to the built "
+                "mapped-host tensor extension when mapped expert scales are enabled"
+            )
+        spec = importlib.util.spec_from_file_location(
+            "mapped_host_tensor_typed_ext", extension_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"Unable to load mapped-host tensor extension {extension_path}"
+            )
+        extension = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(extension)
+        _MAPPED_TENSOR_EXTENSION = extension
+
+    if _MAPPED_TENSOR_CUDART is None:
+        cudart = ctypes.CDLL("libcudart.so.13")
+        cudart.cudaHostGetDevicePointer.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        cudart.cudaHostGetDevicePointer.restype = ctypes.c_int
+        _MAPPED_TENSOR_CUDART = cudart
+
+    device_pointer = ctypes.c_void_p()
+    error = _MAPPED_TENSOR_CUDART.cudaHostGetDevicePointer(
+        ctypes.byref(device_pointer), host_tensor.data_ptr(), 0
+    )
+    if error != 0 or device_pointer.value is None:
+        raise RuntimeError(
+            "cudaHostGetDevicePointer for expert scales failed with CUDA "
+            f"error {error}"
+        )
+
+    extension = _MAPPED_TENSOR_EXTENSION
+    dtype_name = {
+        torch.bfloat16: "bfloat16",
+        torch.int32: "int32",
+        torch.float32: "float32",
+    }.get(host_tensor.dtype, "uint8")
+    mapped = extension.mapped_cuda_tensor_typed(
+        device_pointer.value,
+        list(host_tensor.shape),
+        torch.cuda.current_device(),
+        dtype_name,
+    )
+    if mapped.dtype != host_tensor.dtype:
+        mapped = mapped.view(host_tensor.dtype)
+    return mapped
+
+
+def _load_batch_copy_function(library_path: str) -> Callable[..., int]:
+    function = _BATCH_COPY_FUNCTIONS.get(library_path)
+    if function is not None:
+        return function
+
+    library = ctypes.CDLL(library_path)
+    function = library.vllm_cuda_batch_copy_host_to_device
+    function.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_uint64,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    _BATCH_COPY_FUNCTIONS[library_path] = function
+    return function
+
 
 def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     """Pinned CPU copy of *src* with exactly one cross-device transfer.
@@ -28,6 +122,119 @@ def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     dst = torch.empty_like(src, device="cpu", pin_memory=True)
     dst.copy_(src)
     return dst
+
+
+def registered_host_empty(
+    *shape: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate a 2 MiB-aligned, CUDA-registered CPU tensor.
+
+    The expert cache streams already-repacked FP4 weights from host memory.
+    On the measured PCIe-only Ampere host, aligned anonymous mappings
+    registered with CUDA sustained about 4% more H2D bandwidth than the
+    default PyTorch pinned allocator for the exact four-field expert-copy
+    pattern. Allocations are intentionally process-lifetime: these tensors are
+    the persistent backing store for every cached MoE layer.
+    """
+    elements = math.prod(shape)
+    tensor_bytes = elements * dtype.itemsize
+    huge_page_bytes = 2 << 20
+    registered_bytes = (
+        (tensor_bytes + huge_page_bytes - 1) // huge_page_bytes * huge_page_bytes
+    )
+    mapping = mmap.mmap(
+        -1,
+        registered_bytes + huge_page_bytes,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    mapping_address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+    address = (
+        (mapping_address + huge_page_bytes - 1) // huge_page_bytes
+        * huge_page_bytes
+    )
+    mapping_offset = address - mapping_address
+
+    cudart = ctypes.CDLL("libcudart.so.13")
+    cudart.cudaHostRegister.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cudart.cudaHostRegister.restype = ctypes.c_int
+    error = cudart.cudaHostRegister(address, registered_bytes, 1)
+    if error != 0:
+        mapping.close()
+        raise RuntimeError(
+            "cudaHostRegister for aligned expert backing failed with CUDA "
+            f"error {error}"
+        )
+
+    storage = torch.frombuffer(
+        mapping,
+        dtype=torch.uint8,
+        count=tensor_bytes,
+        offset=mapping_offset,
+    )
+    tensor = storage.view(dtype).view(*shape)
+    _REGISTERED_HOST_ALLOCATIONS.append((mapping, address, registered_bytes))
+    logger.info_once(
+        "Using 2 MiB-aligned CUDA-registered host backing for repacked "
+        "expert weights.",
+        scope="global",
+    )
+    return tensor
+
+
+def write_combined_host_empty(
+    *shape: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate 2 MiB-aligned write-combined pinned host storage.
+
+    Repacked expert weights are written once by the CPU and thereafter only
+    read by GPU DMA. ``cudaHostAllocWriteCombined`` avoids polluting CPU caches
+    and can remove PCIe snoop traffic for exactly that unidirectional access
+    pattern. The base allocation and ctypes buffer stay alive for the process;
+    these tensors are the persistent backing store of the expert cache.
+    """
+    elements = math.prod(shape)
+    tensor_bytes = elements * dtype.itemsize
+    alignment = 2 << 20
+    allocation_bytes = tensor_bytes + alignment
+
+    cudart = ctypes.CDLL("libcudart.so.13")
+    cudart.cudaHostAlloc.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cudart.cudaHostAlloc.restype = ctypes.c_int
+    base_pointer = ctypes.c_void_p()
+    # cudaHostAllocPortable | cudaHostAllocWriteCombined.
+    error = cudart.cudaHostAlloc(
+        ctypes.byref(base_pointer), allocation_bytes, 1 | 4
+    )
+    if error != 0 or base_pointer.value is None:
+        raise RuntimeError(
+            "cudaHostAlloc for write-combined expert backing failed with "
+            f"CUDA error {error}"
+        )
+
+    address = (
+        (base_pointer.value + alignment - 1) // alignment * alignment
+    )
+    owner = (ctypes.c_uint8 * tensor_bytes).from_address(address)
+    storage = torch.frombuffer(owner, dtype=torch.uint8, count=tensor_bytes)
+    tensor = storage.view(dtype).view(*shape)
+    _WRITE_COMBINED_HOST_ALLOCATIONS.append((base_pointer, owner))
+    logger.info_once(
+        "Using 2 MiB-aligned CUDA write-combined host backing for repacked "
+        "expert weights.",
+        scope="global",
+    )
+    return tensor
 
 
 # How a forward too wide for the cache is broken up.
@@ -61,10 +268,28 @@ class ExpertWeightResult:
     expert_map: torch.Tensor
     w1_scale: torch.Tensor | None = None
     w2_scale: torch.Tensor | None = None
+    mapped_scale_bank: int | None = None
+
+
+@dataclass
+class _BorrowedExpertBank:
+    """One independently revocable bank backed by lent KV-cache pages."""
+
+    capacity: int
+    min_tokens: int
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor | None
+    w2_scale: torch.Tensor | None
+    mapping: torch.Tensor
+    mapping_host: torch.Tensor
+    slots: dict[int, int]
+    free_slots: list[int]
+    enabled: bool = True
 
 
 class _SharedExpertStagingPool:
-    """Two GPU banks shared by every compatible MoE layer on one device.
+    """GPU banks shared by every compatible MoE layer on one device.
 
     Long prefills touch nearly every expert in every layer, so preserving the
     contents of the per-layer decode cache has little value for those forwards.
@@ -81,29 +306,58 @@ class _SharedExpertStagingPool:
         expert_map: torch.Tensor,
         w13_scale: torch.Tensor | None,
         w2_scale: torch.Tensor | None,
+        num_banks: int,
     ) -> None:
         self.copy_stream = torch.cuda.Stream(device=w13.device)
         self.banks: list[ExpertWeightResult] = []
-        for _ in range(2):
+        for _ in range(num_banks):
             self.banks.append(
                 ExpertWeightResult(
-                    w1=torch.empty_like(w13, device=w13.device),
-                    w2=torch.empty_like(w2, device=w2.device),
+                    w1=torch.empty(
+                        capacity,
+                        *w13.shape[1:],
+                        dtype=w13.dtype,
+                        device=w13.device,
+                    ),
+                    w2=torch.empty(
+                        capacity,
+                        *w2.shape[1:],
+                        dtype=w2.dtype,
+                        device=w2.device,
+                    ),
                     expert_map=torch.empty_like(expert_map, device=expert_map.device),
                     w1_scale=(
-                        torch.empty_like(w13_scale, device=w13_scale.device)
+                        torch.empty(
+                            capacity,
+                            *w13_scale.shape[1:],
+                            dtype=w13_scale.dtype,
+                            device=w13_scale.device,
+                        )
                         if w13_scale is not None
                         else None
                     ),
                     w2_scale=(
-                        torch.empty_like(w2_scale, device=w2_scale.device)
+                        torch.empty(
+                            capacity,
+                            *w2_scale.shape[1:],
+                            dtype=w2_scale.dtype,
+                            device=w2_scale.device,
+                        )
                         if w2_scale is not None
                         else None
                     ),
                 )
             )
-        self.ready = [torch.cuda.Event() for _ in range(2)]
-        self.consumed = [torch.cuda.Event() for _ in range(2)]
+        self.ready = [torch.cuda.Event() for _ in range(num_banks)]
+        self.consumed = [torch.cuda.Event() for _ in range(num_banks)]
+        # Every layer with this weight shape shares these banks. Seed the
+        # reusable events on the owning device so the copy stream can always
+        # wait before overwriting a bank, including group 0 of the next layer.
+        # Restricting the wait to group_index >= 2 protects reuse within one
+        # layer but races when the following layer wraps back to bank 0.
+        initial_stream = torch.cuda.current_stream(device=w13.device)
+        for event in self.consumed:
+            event.record(initial_stream)
         self.capacity = capacity
 
 
@@ -112,6 +366,7 @@ _SHARED_STAGING_POOLS: dict[tuple[object, ...], _SharedExpertStagingPool] = {}
 
 def _staging_pool_key(
     capacity: int,
+    num_banks: int,
     w13: torch.Tensor,
     w2: torch.Tensor,
     expert_map: torch.Tensor,
@@ -125,6 +380,7 @@ def _staging_pool_key(
 
     return (
         capacity,
+        num_banks,
         tensor_key(w13),
         tensor_key(w2),
         tensor_key(expert_map),
@@ -135,17 +391,32 @@ def _staging_pool_key(
 
 def _get_shared_staging_pool(
     capacity: int,
+    num_banks: int,
     w13: torch.Tensor,
     w2: torch.Tensor,
     expert_map: torch.Tensor,
     w13_scale: torch.Tensor | None,
     w2_scale: torch.Tensor | None,
 ) -> _SharedExpertStagingPool:
-    key = _staging_pool_key(capacity, w13, w2, expert_map, w13_scale, w2_scale)
+    key = _staging_pool_key(
+        capacity,
+        num_banks,
+        w13,
+        w2,
+        expert_map,
+        w13_scale,
+        w2_scale,
+    )
     pool = _SHARED_STAGING_POOLS.get(key)
     if pool is None:
         pool = _SharedExpertStagingPool(
-            capacity, w13, w2, expert_map, w13_scale, w2_scale
+            capacity,
+            w13,
+            w2,
+            expert_map,
+            w13_scale,
+            w2_scale,
+            num_banks,
         )
         _SHARED_STAGING_POOLS[key] = pool
     return pool
@@ -190,6 +461,64 @@ class CachedWeightProvider:
         self.hits = 0
         self.misses = 0
         self._prepare_calls = 0
+        self._route_stats_min_tokens = int(
+            os.getenv("VLLM_MOE_ROUTE_STATS_MIN_TOKENS", "0")
+        )
+        if self._route_stats_min_tokens < 0:
+            raise ValueError("VLLM_MOE_ROUTE_STATS_MIN_TOKENS must be >= 0")
+        self._route_stats_arm_file = os.getenv(
+            "VLLM_MOE_ROUTE_STATS_ARM_FILE", ""
+        )
+        self._route_stats_logged = False
+        self._borrowed_banks: list[_BorrowedExpertBank] = []
+
+        # Long prefills route enough token/expert pairs that they touch every
+        # expert in practice. Discovering that set with unique().tolist()
+        # synchronizes the GPU once per MoE layer, then the generic cache path
+        # submits four H2D copies per individual cache miss. The opt-in bulk
+        # path instead visits fixed, contiguous expert groups and uploads each
+        # weight/scale tensor with one large copy. It deliberately applies
+        # only to expert-split forwards; decode and short prefills retain the
+        # adaptive LFRU path.
+        bulk_prefill_min_tokens = int(
+            os.getenv("VLLM_MOE_EXPERT_CACHE_BULK_PREFILL_MIN_TOKENS", "0")
+        )
+        if bulk_prefill_min_tokens < 0:
+            raise ValueError(
+                "VLLM_MOE_EXPERT_CACHE_BULK_PREFILL_MIN_TOKENS must be >= 0"
+            )
+        self._bulk_prefill_min_tokens = (
+            bulk_prefill_min_tokens if split == "expert" else 0
+        )
+        bulk_copy_chunk_experts = int(
+            os.getenv(
+                "VLLM_MOE_EXPERT_CACHE_BULK_COPY_CHUNK_EXPERTS",
+                str(capacity),
+            )
+        )
+        if bulk_copy_chunk_experts <= 0:
+            raise ValueError(
+                "VLLM_MOE_EXPERT_CACHE_BULK_COPY_CHUNK_EXPERTS must be > 0"
+            )
+        self._bulk_copy_chunk_experts = min(bulk_copy_chunk_experts, capacity)
+
+        self._batched_copy_min_experts = int(
+            os.getenv("VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_MIN_EXPERTS", "0")
+        )
+        if self._batched_copy_min_experts < 0:
+            raise ValueError(
+                "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_MIN_EXPERTS must be >= 0"
+            )
+        self._batched_copy_min_tokens = int(
+            os.getenv("VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_MIN_TOKENS", "512")
+        )
+        if self._batched_copy_min_tokens < 0:
+            raise ValueError(
+                "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_MIN_TOKENS must be >= 0"
+            )
+        self._mapped_scales = os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_MAPPED_SCALES", "0"
+        ).lower() in {"1", "true"}
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
@@ -216,23 +545,79 @@ class CachedWeightProvider:
             # every miss, and pageable source memory forces a staging copy.
             self._cpu_w13_scale: torch.Tensor | None = _pinned_cpu_copy(w13_scale)
             self._cpu_w2_scale: torch.Tensor | None = _pinned_cpu_copy(w2_scale)
-            self._buf_w13_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w13_scale.shape[1:],
-                dtype=w13_scale.dtype,
-                device=cuda_device,
-            )
-            self._buf_w2_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w2_scale.shape[1:],
-                dtype=w2_scale.dtype,
-                device=cuda_device,
-            )
+            if self._mapped_scales:
+                default_banks = math.ceil(num_experts / capacity)
+                mapped_scale_banks = int(
+                    os.getenv("VLLM_MOE_MAPPED_SCALE_BANKS", str(default_banks))
+                )
+                if mapped_scale_banks <= 0:
+                    raise ValueError("VLLM_MOE_MAPPED_SCALE_BANKS must be positive")
+                self._mapped_scale_hosts: list[
+                    tuple[torch.Tensor, torch.Tensor]
+                ] = []
+                self._mapped_scale_aliases: list[
+                    tuple[torch.Tensor, torch.Tensor]
+                ] = []
+                for _ in range(mapped_scale_banks):
+                    w13_host = torch.empty(
+                        capacity,
+                        *w13_scale.shape[1:],
+                        dtype=w13_scale.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    w2_host = torch.empty(
+                        capacity,
+                        *w2_scale.shape[1:],
+                        dtype=w2_scale.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self._mapped_scale_hosts.append((w13_host, w2_host))
+                    self._mapped_scale_aliases.append(
+                        (_mapped_cuda_alias(w13_host), _mapped_cuda_alias(w2_host))
+                    )
+                self._mapped_scale_events = [
+                    torch.cuda.Event() for _ in range(mapped_scale_banks)
+                ]
+                self._mapped_scale_in_use = [False] * mapped_scale_banks
+                self._mapped_scale_cursor = 0
+                self.mapped_scale_waits = 0
+                self._buf_w13_scale, self._buf_w2_scale = (
+                    self._mapped_scale_aliases[0]
+                )
+                logger.info_once(
+                    "Using CUDA-mapped host scales for the expert cache; "
+                    "cache groups rotate over %d host scale banks.",
+                    mapped_scale_banks,
+                    scope="global",
+                )
+            else:
+                self._buf_w13_scale = torch.empty(
+                    capacity,
+                    *w13_scale.shape[1:],
+                    dtype=w13_scale.dtype,
+                    device=cuda_device,
+                )
+                self._buf_w2_scale = torch.empty(
+                    capacity,
+                    *w2_scale.shape[1:],
+                    dtype=w2_scale.dtype,
+                    device=cuda_device,
+                )
+                self._mapped_scale_hosts = []
+                self._mapped_scale_aliases = []
+                self._mapped_scale_events = []
+                self._mapped_scale_in_use = []
         else:
             self._cpu_w13_scale = None
             self._cpu_w2_scale = None
             self._buf_w13_scale = None
             self._buf_w2_scale = None
+            self._mapped_scale_hosts = []
+            self._mapped_scale_aliases = []
+            self._mapped_scale_events = []
+            self._mapped_scale_in_use = []
 
         # LFRU state: {expert_id: [slot, freq, last_access_clock]}
         # Eviction score = freq / (clock - last_access + 1). Lower = evict first.
@@ -254,27 +639,135 @@ class CachedWeightProvider:
             (num_experts,), -1, dtype=torch.int32
         ).pin_memory()
 
+        self._batched_copy_function: Callable[..., int] | None = None
+        self._batched_copy_stream: torch.cuda.Stream | None = None
+        self._batched_copy_ready: torch.cuda.Event | None = None
+        if self._batched_copy_min_experts > 0:
+            library_path = os.getenv(
+                "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY"
+            )
+            if not library_path:
+                raise RuntimeError(
+                    "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY must point "
+                    "to the built CUDA batch-copy shim when batched expert "
+                    "copies are enabled"
+                )
+            self._batched_copy_function = _load_batch_copy_function(library_path)
+            self._batched_copy_stream = torch.cuda.Stream(device=cuda_device)
+            self._batched_copy_ready = torch.cuda.Event()
+            logger.info_once(
+                "Enabled CUDA batched expert-cache H2D copies at >=%d misses "
+                "and >=%d tokens",
+                self._batched_copy_min_experts,
+                self._batched_copy_min_tokens,
+            )
+
+        self._bulk_prefill_groups: list[list[int]] = []
+        self._bulk_prefill_mappings: list[torch.Tensor] = []
+        if self._bulk_prefill_min_tokens > 0:
+            for start in range(0, num_experts, capacity):
+                end = min(start + capacity, num_experts)
+                self._bulk_prefill_groups.append(list(range(start, end)))
+                mapping = torch.full(
+                    (num_experts,), -1, dtype=torch.int32, device=cuda_device
+                )
+                mapping[start:end] = torch.arange(
+                    end - start, dtype=torch.int32, device=cuda_device
+                )
+                self._bulk_prefill_mappings.append(mapping)
+            logger.info_once(
+                "Enabled contiguous expert-cache bulk prefill path at >=%d tokens "
+                "with %d-expert weight-copy chunks",
+                self._bulk_prefill_min_tokens,
+                self._bulk_copy_chunk_experts,
+            )
+
         if async_staging is None:
             async_staging = os.getenv(
                 "VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING", "0"
             ).lower() in {"1", "true"}
+        if self._mapped_scales and async_staging:
+            raise ValueError(
+                "mapped expert scales do not support asynchronous staging"
+            )
         self._async_staging = async_staging and split == "expert"
+        self._interlayer_prefetch = self._async_staging and os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH", "0"
+        ).lower() in {"1", "true"}
+        self._interlayer_prefetch_min_tokens = int(
+            os.getenv(
+                "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS",
+                "512",
+            )
+        )
+        if self._interlayer_prefetch_min_tokens < 0:
+            raise ValueError(
+                "VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS "
+                "must be >= 0"
+            )
         self._staging_pool: _SharedExpertStagingPool | None = None
+        self._staging_capacity = capacity
         self._staging_mapping_hosts: list[torch.Tensor] = []
+        self._lookahead_prediction: list[int] = []
+        self._lookahead_pending_ids: list[int] = []
+        self._lookahead_mapping_host: torch.Tensor | None = None
+        self._lookahead_registry_key: tuple[int, str, int] | None = None
         if self._async_staging:
+            self._staging_capacity = int(
+                os.getenv(
+                    "VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY",
+                    str(capacity),
+                )
+            )
+            if not 0 < self._staging_capacity <= capacity:
+                raise ValueError(
+                    "VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY must be "
+                    f"in [1, {capacity}]"
+                )
             self._staging_pool = _get_shared_staging_pool(
-                capacity,
+                self._staging_capacity,
+                3 if self._interlayer_prefetch else 2,
                 self._buf_w13,
                 self._buf_w2,
                 self._mapping,
                 self._buf_w13_scale,
                 self._buf_w2_scale,
             )
-            num_groups = (num_experts + capacity - 1) // capacity
+            num_groups = (
+                num_experts + self._staging_capacity - 1
+            ) // self._staging_capacity
             self._staging_mapping_hosts = [
                 torch.full((num_experts,), -1, dtype=torch.int32).pin_memory()
                 for _ in range(num_groups)
             ]
+            if self._interlayer_prefetch:
+                self._lookahead_mapping_host = torch.full(
+                    (num_experts,), -1, dtype=torch.int32
+                ).pin_memory()
+                self._lookahead_registry_key = self._parse_layer_registry_key(
+                    name,
+                    cuda_device,
+                )
+                if self._lookahead_registry_key is not None:
+                    _INTERLAYER_PROVIDERS[self._lookahead_registry_key] = self
+
+    @staticmethod
+    def _parse_layer_registry_key(
+        name: str, device: torch.device
+    ) -> tuple[int, str, int] | None:
+        marker = ".layers."
+        if marker not in name:
+            return None
+        prefix, suffix = name.split(marker, 1)
+        layer_text = suffix.split(".", 1)[0]
+        try:
+            layer_index = int(layer_text)
+        except ValueError:
+            return None
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        return device_index, prefix, layer_index
 
     @property
     def buf_w13(self) -> torch.Tensor:
@@ -292,6 +785,264 @@ class CachedWeightProvider:
     def buf_w2_scale(self) -> torch.Tensor | None:
         return self._buf_w2_scale
 
+    def _base_borrowed_bank(self) -> _BorrowedExpertBank | None:
+        return self._borrowed_banks[0] if self._borrowed_banks else None
+
+    # Keep the original one-bank diagnostics/tests source-compatible while the
+    # runtime can carry multiple independently revocable tiers.
+    @property
+    def _borrowed_capacity(self) -> int:
+        bank = self._base_borrowed_bank()
+        return bank.capacity if bank is not None else 0
+
+    @property
+    def _borrowed_min_tokens(self) -> int:
+        bank = self._base_borrowed_bank()
+        return bank.min_tokens if bank is not None else 0
+
+    @property
+    def _borrowed_enabled(self) -> bool:
+        bank = self._base_borrowed_bank()
+        return bank.enabled if bank is not None else False
+
+    @property
+    def _borrowed_w13(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.w13 if bank is not None else None
+
+    @property
+    def _borrowed_w2(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.w2 if bank is not None else None
+
+    @property
+    def _borrowed_w13_scale(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.w13_scale if bank is not None else None
+
+    @property
+    def _borrowed_w2_scale(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.w2_scale if bank is not None else None
+
+    @property
+    def _borrowed_mapping(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.mapping if bank is not None else None
+
+    @property
+    def _borrowed_mapping_host(self) -> torch.Tensor | None:
+        bank = self._base_borrowed_bank()
+        return bank.mapping_host if bank is not None else None
+
+    @property
+    def _borrowed_slots(self) -> dict[int, int]:
+        bank = self._base_borrowed_bank()
+        return bank.slots if bank is not None else {}
+
+    @property
+    def _borrowed_free_slots(self) -> list[int]:
+        bank = self._base_borrowed_bank()
+        return bank.free_slots if bank is not None else []
+
+    def borrowed_tensor_specs(
+        self, capacity: int
+    ) -> list[tuple[torch.dtype, tuple[int, ...]]]:
+        """Shapes needed for an auxiliary expert bank.
+
+        The runner uses this to carve typed views out of never-yet-allocated
+        high KV block slabs.  Returning only metadata keeps the provider
+        independent of the KV allocator.
+        """
+        if capacity <= 0:
+            raise ValueError("borrowed expert capacity must be positive")
+
+        tensors = [self._buf_w13, self._buf_w2]
+        if self._buf_w13_scale is not None:
+            assert self._buf_w2_scale is not None
+            tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
+        return [
+            (tensor.dtype, (capacity, *tensor.shape[1:])) for tensor in tensors
+        ]
+
+    def attach_borrowed_buffers(
+        self,
+        buffers: list[torch.Tensor],
+        min_tokens: int,
+    ) -> int:
+        """Attach an independently revocable cache bank from lent KV pages.
+
+        Banks are ordered from most durable to most opportunistic.  The
+        returned index is carried by the runner's KV-tail tier state so a
+        scheduler fence can disable exactly the bank whose pages it reached.
+        """
+        expected = 4 if self._buf_w13_scale is not None else 2
+        if len(buffers) != expected:
+            raise ValueError(
+                f"borrowed expert bank expected {expected} tensors, "
+                f"received {len(buffers)}"
+            )
+        capacity = buffers[0].size(0)
+        specs = self.borrowed_tensor_specs(capacity)
+        for tensor, (dtype, shape) in zip(buffers, specs):
+            if tensor.dtype != dtype or tuple(tensor.shape) != shape:
+                raise ValueError(
+                    "borrowed expert tensor mismatch: "
+                    f"got {tensor.dtype} {tuple(tensor.shape)}, "
+                    f"expected {dtype} {shape}"
+                )
+            if tensor.device != self._buf_w13.device or not tensor.is_contiguous():
+                raise ValueError(
+                    "borrowed expert tensors must be contiguous on the cache GPU"
+                )
+
+        bank = _BorrowedExpertBank(
+            capacity=capacity,
+            min_tokens=min_tokens,
+            w13=buffers[0],
+            w2=buffers[1],
+            w13_scale=buffers[2] if expected == 4 else None,
+            w2_scale=buffers[3] if expected == 4 else None,
+            mapping=torch.full(
+                (self._num_experts,),
+                -1,
+                dtype=torch.int32,
+                device=self._buf_w13.device,
+            ),
+            mapping_host=torch.full(
+                (self._num_experts,), -1, dtype=torch.int32
+            ).pin_memory(),
+            slots={},
+            free_slots=list(range(capacity - 1, -1, -1)),
+        )
+        self._borrowed_banks.append(bank)
+        return len(self._borrowed_banks) - 1
+
+    def disable_borrowed_buffers(self, bank_index: int = 0) -> None:
+        """Permanently stop touching one KV-backed bank in this process."""
+        if not 0 <= bank_index < len(self._borrowed_banks):
+            raise IndexError(f"borrowed expert bank index {bank_index} is invalid")
+        bank = self._borrowed_banks[bank_index]
+        if not bank.enabled:
+            return
+        bank.enabled = False
+        bank.slots.clear()
+        bank.free_slots.clear()
+
+    def _plan_one_borrowed_group(
+        self,
+        bank_index: int,
+        topk_ids: torch.Tensor,
+        valid_unique_ids: list[int],
+        excluded_ids: set[int],
+    ) -> list[int]:
+        bank = self._borrowed_banks[bank_index]
+        if not bank.enabled or topk_ids.size(0) < bank.min_tokens:
+            return []
+
+        used = set(valid_unique_ids)
+        group = [
+            expert_id
+            for expert_id in bank.slots
+            if expert_id in used and expert_id not in excluded_ids
+        ]
+        vacancies = bank.capacity - len(bank.slots)
+        if vacancies > 0:
+            candidates = [
+                expert_id
+                for expert_id in valid_unique_ids
+                if expert_id not in bank.slots and expert_id not in excluded_ids
+            ]
+            group.extend(candidates[:vacancies])
+
+        for expert_id in group:
+            self.invalidate(expert_id)
+        return group
+
+    def plan_borrowed_groups(
+        self,
+        topk_ids: torch.Tensor,
+        unique_ids: list[int],
+        excluded_ids: set[int] | None = None,
+    ) -> list[tuple[int, list[int]]]:
+        """Choose disjoint expert groups for every still-active KV tier."""
+        valid_unique_ids = [
+            expert_id
+            for expert_id in unique_ids
+            if 0 <= expert_id < self._num_experts
+        ]
+        excluded = set() if excluded_ids is None else set(excluded_ids)
+        groups: list[tuple[int, list[int]]] = []
+        for bank_index in range(len(self._borrowed_banks)):
+            group = self._plan_one_borrowed_group(
+                bank_index, topk_ids, valid_unique_ids, excluded
+            )
+            if group:
+                groups.append((bank_index, group))
+                excluded.update(group)
+        return groups
+
+    def plan_borrowed_group(
+        self, topk_ids: torch.Tensor, unique_ids: list[int]
+    ) -> list[int]:
+        """Compatibility helper returning the most durable bank's group."""
+        if not self._borrowed_banks:
+            return []
+        valid_unique_ids = [
+            expert_id
+            for expert_id in unique_ids
+            if 0 <= expert_id < self._num_experts
+        ]
+        return self._plan_one_borrowed_group(
+            0, topk_ids, valid_unique_ids, set()
+        )
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def prepare_borrowed_group(
+        self, expert_ids: list[int], bank_index: int = 0
+    ) -> ExpertWeightResult:
+        """Populate/select one group in an active KV-tail expert bank."""
+        if not 0 <= bank_index < len(self._borrowed_banks):
+            raise IndexError(f"borrowed expert bank index {bank_index} is invalid")
+        bank = self._borrowed_banks[bank_index]
+        if not bank.enabled:
+            raise RuntimeError("borrowed expert bank is not active")
+        if len(expert_ids) > bank.capacity:
+            raise RuntimeError("borrowed expert group exceeds its capacity")
+
+        for expert_id in expert_ids:
+            if expert_id in bank.slots:
+                continue
+            if not bank.free_slots:
+                raise RuntimeError("borrowed expert bank has no free slot")
+            slot = bank.free_slots.pop()
+            bank.slots[expert_id] = slot
+            bank.w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
+            bank.w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+            if bank.w13_scale is not None:
+                assert self._cpu_w13_scale is not None
+                assert self._cpu_w2_scale is not None
+                assert bank.w2_scale is not None
+                bank.w13_scale[slot].copy_(
+                    self._cpu_w13_scale[expert_id], non_blocking=True
+                )
+                bank.w2_scale[slot].copy_(
+                    self._cpu_w2_scale[expert_id], non_blocking=True
+                )
+
+        bank.mapping_host.fill_(-1)
+        for expert_id in expert_ids:
+            bank.mapping_host[expert_id] = bank.slots[expert_id]
+        bank.mapping.copy_(bank.mapping_host)
+        return ExpertWeightResult(
+            w1=bank.w13,
+            w2=bank.w2,
+            expert_map=bank.mapping,
+            w1_scale=bank.w13_scale,
+            w2_scale=bank.w2_scale,
+        )
+
     def invalidate(self, expert_id: int) -> None:
         """Remove *expert_id* from the cache, returning its slot to the free
         list.  No-op if the expert is not currently cached."""
@@ -302,6 +1053,205 @@ class CachedWeightProvider:
     @property
     def async_staging_enabled(self) -> bool:
         return self._staging_pool is not None
+
+    @property
+    def async_staging_ready(self) -> bool:
+        """Whether miss-only staging can preserve a warm primary cache.
+
+        The original staging experiment bypassed ``prepare()`` from the first
+        forward onward.  That left the layer LRU empty, so every later prompt
+        recopied even experts which should have been hits.  Run one normal
+        fill before staging misses; afterward the resident group keeps the
+        primary cache hot while the shared banks carry only true misses.
+        """
+        # Decode may briefly admit an expert already held by a borrowed
+        # prefill bank. The next long-prefill plan invalidates that duplicate,
+        # so requiring an exactly full LRU would disable staging even though
+        # nearly every primary slot remains useful. Conversely, a handful of
+        # decode entries is not enough to justify bypassing the normal fill.
+        minimum_residency = max(1, (self.capacity + 1) // 2)
+        return (
+            self._staging_pool is not None
+            and len(self._lru) >= minimum_residency
+        )
+
+    def group_is_resident(self, expert_ids: list[int]) -> bool:
+        """Whether every expert in a planned group is in the layer cache."""
+        return all(expert_id in self._lru for expert_id in expert_ids)
+
+    def remember_prefill_route(self, topk_ids: torch.Tensor) -> None:
+        """Remember the prior prefill's busiest experts for lookahead."""
+        if (
+            not self._interlayer_prefetch
+            or topk_ids.size(0) < self._interlayer_prefetch_min_tokens
+        ):
+            return
+        valid = topk_ids[(topk_ids >= 0) & (topk_ids < self._num_experts)]
+        counts = torch.bincount(
+            valid.to(torch.int64), minlength=self._num_experts
+        ).tolist()
+        self._lookahead_prediction = sorted(
+            (
+                expert_id
+                for expert_id in range(self._num_experts)
+                if counts[expert_id] > 0
+            ),
+            key=lambda expert_id: (-counts[expert_id], expert_id),
+        )
+
+    def prefetch_successor(self, num_tokens: int) -> None:
+        """Upload one predicted group for the next MoE layer."""
+        key = self._lookahead_registry_key
+        if (
+            key is None
+            or num_tokens < self._interlayer_prefetch_min_tokens
+        ):
+            return
+        device_index, prefix, layer_index = key
+        successor = _INTERLAYER_PROVIDERS.get(
+            (device_index, prefix, layer_index + 1)
+        )
+        if successor is not None:
+            successor._schedule_lookahead()
+
+    def _schedule_lookahead(self) -> None:
+        pool = self._staging_pool
+        if (
+            not self._interlayer_prefetch
+            or pool is None
+            or len(pool.banks) < 3
+            or not self._lookahead_prediction
+            or self._lookahead_pending_ids
+        ):
+            return
+
+        resident = set(self._lru)
+        for bank in self._borrowed_banks:
+            if bank.enabled:
+                resident.update(bank.slots)
+        expert_ids = [
+            expert_id
+            for expert_id in self._lookahead_prediction
+            if expert_id not in resident
+        ][: self._staging_capacity]
+        if not expert_ids:
+            return
+
+        bank_index = 2
+        result = pool.banks[bank_index]
+        mapping_host = self._lookahead_mapping_host
+        assert mapping_host is not None
+        mapping_host.fill_(-1)
+        for slot, expert_id in enumerate(expert_ids):
+            mapping_host[expert_id] = slot
+
+        with torch.cuda.stream(pool.copy_stream):
+            pool.copy_stream.wait_event(pool.consumed[bank_index])
+            for slot, expert_id in enumerate(expert_ids):
+                result.w1[slot].copy_(
+                    self._cpu_w13[expert_id], non_blocking=True
+                )
+                result.w2[slot].copy_(
+                    self._cpu_w2[expert_id], non_blocking=True
+                )
+                if result.w1_scale is not None:
+                    assert self._cpu_w13_scale is not None
+                    assert self._cpu_w2_scale is not None
+                    assert result.w2_scale is not None
+                    result.w1_scale[slot].copy_(
+                        self._cpu_w13_scale[expert_id], non_blocking=True
+                    )
+                    result.w2_scale[slot].copy_(
+                        self._cpu_w2_scale[expert_id], non_blocking=True
+                    )
+            result.expert_map.copy_(mapping_host, non_blocking=True)
+            pool.ready[bank_index].record(pool.copy_stream)
+        self._lookahead_pending_ids = expert_ids
+
+    def take_lookahead_group(
+        self, unique_ids: list[int]
+    ) -> tuple[list[int], ExpertWeightResult] | None:
+        """Return the predicted experts actually used by this forward."""
+        pool = self._staging_pool
+        if pool is None or len(pool.banks) < 3 or not self._lookahead_pending_ids:
+            return None
+        used = set(unique_ids)
+        actual = [
+            expert_id
+            for expert_id in self._lookahead_pending_ids
+            if expert_id in used
+        ]
+        if not actual:
+            self._lookahead_pending_ids = []
+            return None
+        return actual, pool.banks[2]
+
+    def wait_lookahead_group(self) -> None:
+        pool = self._staging_pool
+        if pool is None or len(pool.banks) < 3:
+            raise RuntimeError("inter-layer expert prefetch is not enabled")
+        torch.cuda.current_stream(device=pool.banks[2].w1.device).wait_event(
+            pool.ready[2]
+        )
+
+    def release_lookahead_group(self) -> None:
+        pool = self._staging_pool
+        if pool is None or len(pool.banks) < 3:
+            raise RuntimeError("inter-layer expert prefetch is not enabled")
+        pool.consumed[2].record(
+            torch.cuda.current_stream(device=pool.banks[2].w1.device)
+        )
+        self._lookahead_pending_ids = []
+
+    def _prepare_mapped_scale_bank(
+        self, expert_ids: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Populate the next host scale bank in the current weight-slot order."""
+        if not self._mapped_scale_aliases:
+            raise RuntimeError("mapped expert scales are not enabled")
+        assert self._cpu_w13_scale is not None
+        assert self._cpu_w2_scale is not None
+
+        bank_index = self._mapped_scale_cursor
+        self._mapped_scale_cursor = (bank_index + 1) % len(
+            self._mapped_scale_aliases
+        )
+        if self._mapped_scale_in_use[bank_index]:
+            event = self._mapped_scale_events[bank_index]
+            if not event.query():
+                self.mapped_scale_waits += 1
+                event.synchronize()
+
+        w13_host, w2_host = self._mapped_scale_hosts[bank_index]
+        for expert_id in expert_ids:
+            slot = self._lru[expert_id][0]
+            w13_host[slot].copy_(self._cpu_w13_scale[expert_id])
+            w2_host[slot].copy_(self._cpu_w2_scale[expert_id])
+        w13_alias, w2_alias = self._mapped_scale_aliases[bank_index]
+        return w13_alias, w2_alias, bank_index
+
+    def release_mapped_scale_bank(self, result: ExpertWeightResult) -> None:
+        """Protect a mapped scale bank until its queued Marlin work completes."""
+        bank_index = result.mapped_scale_bank
+        if bank_index is None:
+            return
+        self._mapped_scale_events[bank_index].record(
+            torch.cuda.current_stream(device=self._buf_w13.device)
+        )
+        self._mapped_scale_in_use[bank_index] = True
+
+    def uses_bulk_prefill(self, topk_ids: torch.Tensor) -> bool:
+        """Whether this forward can use fixed contiguous expert groups.
+
+        This test reads shape metadata only. In particular, it must not inspect
+        tensor values or synchronize the device: avoiding that synchronization
+        is one of the fast path's primary purposes.
+        """
+        return (
+            self._bulk_prefill_min_tokens > 0
+            and topk_ids.size(0) >= self._bulk_prefill_min_tokens
+            and len(self._bulk_prefill_groups) > 1
+        )
 
     def _record_prepare_stats(self, hits: int, misses: int) -> None:
         self.hits += hits
@@ -318,10 +1268,74 @@ class CachedWeightProvider:
                     100.0 * self.hits / total,
                 )
 
+    def _copy_experts_batched(self, misses: list[tuple[int, int]]) -> None:
+        """Submit all weight and scale misses as one CUDA batch."""
+        function = self._batched_copy_function
+        copy_stream = self._batched_copy_stream
+        ready = self._batched_copy_ready
+        if function is None or copy_stream is None or ready is None:
+            raise RuntimeError("CUDA batched expert copy is not initialized")
+
+        destination_pointers: list[int] = []
+        source_pointers: list[int] = []
+        sizes: list[int] = []
+
+        def append_tensor_copies(
+            destination: torch.Tensor, source: torch.Tensor
+        ) -> None:
+            if not destination[0].is_contiguous() or not source[0].is_contiguous():
+                raise RuntimeError(
+                    "CUDA batched expert copy requires contiguous per-expert tensors"
+                )
+            destination_stride = destination.stride(0) * destination.element_size()
+            source_stride = source.stride(0) * source.element_size()
+            copy_size = source[0].numel() * source.element_size()
+            for slot, expert_id in misses:
+                destination_pointers.append(
+                    destination.data_ptr() + slot * destination_stride
+                )
+                source_pointers.append(source.data_ptr() + expert_id * source_stride)
+                sizes.append(copy_size)
+
+        append_tensor_copies(self._buf_w13, self._cpu_w13)
+        append_tensor_copies(self._buf_w2, self._cpu_w2)
+        if self._buf_w13_scale is not None and not self._mapped_scales:
+            assert self._cpu_w13_scale is not None
+            assert self._cpu_w2_scale is not None
+            assert self._buf_w2_scale is not None
+            append_tensor_copies(self._buf_w13_scale, self._cpu_w13_scale)
+            append_tensor_copies(self._buf_w2_scale, self._cpu_w2_scale)
+
+        count = len(destination_pointers)
+        destinations_array = (ctypes.c_uint64 * count)(*destination_pointers)
+        sources_array = (ctypes.c_uint64 * count)(*source_pointers)
+        sizes_array = (ctypes.c_size_t * count)(*sizes)
+
+        compute_stream = torch.cuda.current_stream(device=self._buf_w13.device)
+        copy_stream.wait_stream(compute_stream)
+        device_index = self._buf_w13.device.index
+        assert device_index is not None
+        error = function(
+            destinations_array,
+            sources_array,
+            sizes_array,
+            count,
+            copy_stream.cuda_stream,
+            device_index,
+        )
+        if error != 0:
+            raise RuntimeError(f"cudaMemcpyBatchAsync failed with CUDA error {error}")
+        ready.record(copy_stream)
+        compute_stream.wait_event(ready)
+
     @eager_break_during_capture
     @torch.compiler.disable
     def prepare_staged_group(
-        self, unique_ids: list[int], group_index: int
+        self,
+        unique_ids: list[int],
+        group_index: int,
+        *,
+        wait_for_ready: bool = True,
     ) -> ExpertWeightResult:
         """Stage one prefill expert group on a device-wide double buffer.
 
@@ -333,10 +1347,10 @@ class CachedWeightProvider:
         pool = self._staging_pool
         if pool is None:
             raise RuntimeError("asynchronous expert staging is not enabled")
-        if len(unique_ids) > self.capacity:
+        if len(unique_ids) > pool.capacity:
             raise RuntimeError(
                 f"CachedWeightProvider: {len(unique_ids)} unique experts "
-                f"requested but staging capacity is {self.capacity}."
+                f"requested but staging capacity is {pool.capacity}."
             )
         if group_index >= len(self._staging_mapping_hosts):
             raise RuntimeError(
@@ -353,8 +1367,11 @@ class CachedWeightProvider:
 
         compute_stream = torch.cuda.current_stream(device=result.w1.device)
         with torch.cuda.stream(pool.copy_stream):
-            if group_index >= 2:
-                pool.copy_stream.wait_event(pool.consumed[bank_index])
+            # Pools are shared across layers, so bank lifetime is not scoped
+            # to this provider's group indices. Always honor the last consumer
+            # event; the events are initialized as reusable when the pool is
+            # created.
+            pool.copy_stream.wait_event(pool.consumed[bank_index])
             for slot, expert_id in enumerate(unique_ids):
                 result.w1[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
                 result.w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
@@ -371,9 +1388,22 @@ class CachedWeightProvider:
             result.expert_map.copy_(mapping_host, non_blocking=True)
             pool.ready[bank_index].record(pool.copy_stream)
 
-        compute_stream.wait_event(pool.ready[bank_index])
+        if wait_for_ready:
+            compute_stream.wait_event(pool.ready[bank_index])
         self._record_prepare_stats(hits=0, misses=len(unique_ids))
         return result
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def wait_staged_group(self, group_index: int) -> None:
+        """Make the compute stream wait for an earlier speculative upload."""
+        pool = self._staging_pool
+        if pool is None:
+            raise RuntimeError("asynchronous expert staging is not enabled")
+        bank_index = group_index % 2
+        torch.cuda.current_stream(
+            device=pool.banks[bank_index].w1.device
+        ).wait_event(pool.ready[bank_index])
 
     @eager_break_during_capture
     @torch.compiler.disable
@@ -385,6 +1415,81 @@ class CachedWeightProvider:
         bank_index = group_index % 2
         pool.consumed[bank_index].record(
             torch.cuda.current_stream(device=pool.banks[bank_index].w1.device)
+        )
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def prepare_bulk_prefill_group(self, group_index: int) -> ExpertWeightResult:
+        """Upload one fixed contiguous expert group with bulk H2D copies.
+
+        The existing per-layer cache buffers are reused, so this adds no large
+        device allocation. Copies and the following MoE kernel share the
+        current stream; overwriting the buffer for the next group is therefore
+        ordered after the current group's kernel without a host synchronize.
+        """
+        if group_index >= len(self._bulk_prefill_groups):
+            raise RuntimeError(
+                f"bulk prefill group index {group_index} exceeds the "
+                f"{len(self._bulk_prefill_groups)} available groups"
+            )
+
+        expert_ids = self._bulk_prefill_groups[group_index]
+        start = expert_ids[0]
+        end = expert_ids[-1] + 1
+        count = end - start
+
+        # A single 64-expert W13 transfer is roughly 128 MiB for DSV4 TP4.
+        # Four workers issuing transfers that large at once produce unfair,
+        # bursty PCIe service. Chunk only the large weight tensors to preserve
+        # inter-rank fairness while still removing most copy submissions. The
+        # much smaller scale tensors remain one transfer per group.
+        for source_start in range(start, end, self._bulk_copy_chunk_experts):
+            source_end = min(source_start + self._bulk_copy_chunk_experts, end)
+            target_start = source_start - start
+            target_end = source_end - start
+            self._buf_w13[target_start:target_end].copy_(
+                self._cpu_w13[source_start:source_end], non_blocking=True
+            )
+            self._buf_w2[target_start:target_end].copy_(
+                self._cpu_w2[source_start:source_end], non_blocking=True
+            )
+        if self._buf_w13_scale is not None and not self._mapped_scales:
+            assert self._cpu_w13_scale is not None
+            assert self._cpu_w2_scale is not None
+            assert self._buf_w2_scale is not None
+            self._buf_w13_scale[:count].copy_(
+                self._cpu_w13_scale[start:end], non_blocking=True
+            )
+            self._buf_w2_scale[:count].copy_(
+                self._cpu_w2_scale[start:end], non_blocking=True
+            )
+
+        # The bulk upload overwrites every occupied slot. Keep the adaptive
+        # cache metadata truthful so the next decode/short-prefill prepare()
+        # can reuse or evict the final group's weights normally.
+        self._clock += 1
+        self._lru = {
+            expert_id: [slot, 1, self._clock]
+            for slot, expert_id in enumerate(expert_ids)
+        }
+        self._free_slots = list(range(count, self.capacity))
+        self._record_prepare_stats(hits=0, misses=count)
+
+        result_w13_scale = self._buf_w13_scale
+        result_w2_scale = self._buf_w2_scale
+        mapped_scale_bank = None
+        if self._mapped_scales:
+            result_w13_scale, result_w2_scale, mapped_scale_bank = (
+                self._prepare_mapped_scale_bank(expert_ids)
+            )
+
+        return ExpertWeightResult(
+            w1=self._buf_w13,
+            w2=self._buf_w2,
+            expert_map=self._bulk_prefill_mappings[group_index],
+            w1_scale=result_w13_scale,
+            w2_scale=result_w2_scale,
+            mapped_scale_bank=mapped_scale_bank,
         )
 
     @torch.compiler.disable
@@ -444,7 +1549,12 @@ class CachedWeightProvider:
         return chunks
 
     @torch.compiler.disable
-    def plan_expert_groups(self, topk_ids: torch.Tensor) -> list[list[int]]:
+    def plan_expert_groups(
+        self,
+        topk_ids: torch.Tensor,
+        unique_ids: list[int] | None = None,
+        excluded_ids: set[int] | None = None,
+    ) -> list[list[int]]:
         """Split the forward's experts into groups the cache can hold at once.
 
         A token's output is the weighted sum of its experts' outputs, so the
@@ -467,9 +1577,87 @@ class CachedWeightProvider:
             single group when everything already fits, which is the common
             case.
         """
-        unique = topk_ids.unique().tolist()
+        if (
+            not self._route_stats_logged
+            and self._route_stats_min_tokens > 0
+            and topk_ids.size(0) >= self._route_stats_min_tokens
+            and (
+                not self._route_stats_arm_file
+                or os.path.exists(self._route_stats_arm_file)
+            )
+        ):
+            # One-shot diagnostic for choosing a principled CPU/GPU or
+            # multi-device split.  Only 256 int64 counters cross the PCIe bus;
+            # subsequent forwards pay no instrumentation cost.
+            flat_ids = topk_ids.reshape(-1)
+            # Profiling/capture inputs can contain the -1 sentinel. Although
+            # the arm file keeps those warmups out of this diagnostic, retain
+            # the same validity rule as the MoE router so instrumentation can
+            # never make an otherwise-valid forward fail.
+            valid_ids = flat_ids[
+                (flat_ids >= 0) & (flat_ids < self._num_experts)
+            ]
+            counts = torch.bincount(
+                valid_ids.to(torch.int64), minlength=self._num_experts
+            ).cpu()
+            used = [
+                (expert_id, int(count))
+                for expert_id, count in enumerate(counts.tolist())
+                if count > 0
+            ]
+            used.sort(key=lambda item: (-item[1], item[0]))
+            total_pairs = sum(count for _, count in used)
+            coverage = {}
+            for resident_count in (8, 16, 32, 48, 64, 96, 128):
+                covered = sum(count for _, count in used[:resident_count])
+                coverage[resident_count] = (
+                    covered / total_pairs if total_pairs else 0.0
+                )
+            rare = {
+                threshold: sum(1 for _, count in used if count <= threshold)
+                for threshold in (1, 2, 4, 8, 16)
+            }
+            logger.info(
+                "MoE route histogram %s: tokens=%d pairs=%d unique=%d "
+                "coverage=%s rare_experts=%s counts=%s",
+                self.name,
+                topk_ids.size(0),
+                total_pairs,
+                len(used),
+                coverage,
+                rare,
+                used,
+            )
+            self._route_stats_logged = True
+
+        if self.uses_bulk_prefill(topk_ids) and not excluded_ids:
+            return self._bulk_prefill_groups
+
+        unique = topk_ids.unique().tolist() if unique_ids is None else unique_ids
+        if excluded_ids:
+            unique = [
+                expert_id for expert_id in unique if expert_id not in excluded_ids
+            ]
         if len(unique) <= self.capacity:
             return [unique]
+        # A chunked prefill commonly touches all experts in every chunk. The
+        # prior implementation began from unique() order, immediately evicted
+        # the group left resident by the preceding chunk, and therefore copied
+        # every expert again. Consume residents first so up to one full group
+        # is evaluated without H2D traffic before cold groups reuse its slots.
+        resident = [expert_id for expert_id in unique if expert_id in self._lru]
+        missing = [expert_id for expert_id in unique if expert_id not in self._lru]
+        if self.async_staging_ready:
+            # Do not pad the resident group with misses. A mixed group would
+            # be staged in its entirety, redundantly uploading every cache hit
+            # and recreating the failure mode of the first async prototype.
+            groups = [resident] if resident else []
+            groups.extend(
+                missing[i : i + self._staging_capacity]
+                for i in range(0, len(missing), self._staging_capacity)
+            )
+            return groups
+        unique = resident + missing
         return [
             unique[i : i + self.capacity] for i in range(0, len(unique), self.capacity)
         ]
@@ -514,6 +1702,7 @@ class CachedWeightProvider:
         # rather than corrupting silently, but it must not happen at all.
         needed = set(unique_ids)
 
+        misses_to_copy: list[tuple[int, int]] = []
         for expert_id in unique_ids:
             if expert_id in self._lru:
                 # Cache hit: update frequency and recency
@@ -544,10 +1733,30 @@ class CachedWeightProvider:
                     assert best_key is not None
                     slot = self._lru.pop(best_key)[0]
 
-                # Copy expert weights from CPU to GPU slot
+                self._clock += 1
+                self._lru[expert_id] = [slot, 1, self._clock]
+                self.misses += 1
+                misses_to_copy.append((slot, expert_id))
+
+        result_w13_scale = self._buf_w13_scale
+        result_w2_scale = self._buf_w2_scale
+        mapped_scale_bank = None
+        if self._mapped_scales:
+            result_w13_scale, result_w2_scale, mapped_scale_bank = (
+                self._prepare_mapped_scale_bank(unique_ids)
+            )
+
+        if (
+            self._batched_copy_function is not None
+            and len(misses_to_copy) >= self._batched_copy_min_experts
+            and topk_ids.size(0) >= self._batched_copy_min_tokens
+        ):
+            self._copy_experts_batched(misses_to_copy)
+        else:
+            for slot, expert_id in misses_to_copy:
                 self._buf_w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
                 self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
-                if self._buf_w13_scale is not None:
+                if self._buf_w13_scale is not None and not self._mapped_scales:
                     assert self._cpu_w13_scale is not None
                     assert self._cpu_w2_scale is not None
                     assert self._buf_w2_scale is not None
@@ -557,10 +1766,6 @@ class CachedWeightProvider:
                     self._buf_w2_scale[slot].copy_(
                         self._cpu_w2_scale[expert_id], non_blocking=True
                     )
-
-                self._clock += 1
-                self._lru[expert_id] = [slot, 1, self._clock]
-                self.misses += 1
 
         # Hits and misses were updated in the loop because LFRU needs those
         # counters immediately; only advance/log the prepare-call interval.
@@ -578,9 +1783,12 @@ class CachedWeightProvider:
             w1=self._buf_w13,
             w2=self._buf_w2,
             expert_map=self._mapping,
-            w1_scale=self._buf_w13_scale,
-            w2_scale=self._buf_w2_scale,
+            w1_scale=result_w13_scale,
+            w2_scale=result_w2_scale,
+            mapped_scale_bank=mapped_scale_bank,
         )
+
+_INTERLAYER_PROVIDERS: dict[tuple[int, str, int], CachedWeightProvider] = {}
 
 
 def run_with_expert_cache(
@@ -605,6 +1813,18 @@ def run_with_expert_cache(
     When everything fits -- the common case for both splits -- ``run`` is
     called exactly once and its result returned untouched.
     """
+    def run_and_release(
+        result: ExpertWeightResult, rows: slice, include_shared: bool
+    ) -> torch.Tensor:
+        part = run(result, rows, include_shared)
+        provider.release_mapped_scale_bank(result)
+        return part
+
+    def finish_forward(output: torch.Tensor) -> torch.Tensor:
+        provider.remember_prefill_route(topk_ids)
+        provider.prefetch_successor(topk_ids.size(0))
+        return output
+
     # Breakable CUDA graphs can safely replay dynamic cache preparation only
     # when the captured graph has a fixed number of MoE kernel calls. If the
     # total number of routed pairs fits in the cache, the unique expert count
@@ -613,42 +1833,141 @@ def run_with_expert_cache(
     # segment. This covers the captured decode sizes (1 and 2) without freezing
     # their expert ids into the graph.
     if topk_ids.numel() <= provider.capacity:
-        return run(provider.prepare(topk_ids), _ALL_ROWS, True)
+        return finish_forward(
+            run_and_release(provider.prepare(topk_ids), _ALL_ROWS, True)
+        )
 
     if provider.split == "expert":
-        groups = provider.plan_expert_groups(topk_ids)
-        if len(groups) == 1:
-            return run(provider.prepare(topk_ids, groups[0]), _ALL_ROWS, True)
+        unique_ids = topk_ids.unique().tolist()
+        lookahead = provider.take_lookahead_group(unique_ids)
+        lookahead_ids = lookahead[0] if lookahead is not None else []
+        borrowed_groups = provider.plan_borrowed_groups(
+            topk_ids,
+            unique_ids,
+            excluded_ids=set(lookahead_ids),
+        )
+        borrowed_ids = {
+            expert_id
+            for _, group in borrowed_groups
+            for expert_id in group
+        }
+        # Keep the policy fixed for the whole forward. Borrowed-bank planning
+        # intentionally invalidates duplicate primary entries, so snapshot
+        # readiness afterward: the group planner and executor must observe the
+        # same post-invalidation cache state.
+        async_staging_ready = provider.async_staging_ready
+        bulk_prefill = (
+            provider.uses_bulk_prefill(topk_ids)
+            and not borrowed_groups
+            and lookahead is None
+        )
+        groups = provider.plan_expert_groups(
+            topk_ids,
+            unique_ids=unique_ids,
+            excluded_ids=borrowed_ids | set(lookahead_ids),
+        )
+        if not borrowed_groups and lookahead is None and len(groups) == 1:
+            return finish_forward(
+                run_and_release(
+                    provider.prepare(topk_ids, groups[0]),
+                    _ALL_ROWS,
+                    True,
+                )
+            )
+
+        execution_groups: list[tuple[str, int | None, list[int]]] = [
+            ("borrowed", bank_index, group)
+            for bank_index, group in borrowed_groups
+        ]
+        if lookahead is not None:
+            execution_groups.append(("lookahead", None, lookahead_ids))
+        execution_groups.extend(
+            ("primary", None, group) for group in groups if group
+        )
+
+        # Launch the first true-miss upload before enqueueing the resident
+        # groups. Deferring only its ready-event wait gives the copy stream the
+        # full resident-compute lead time without allocating another bank.
+        prestaged_execution_index: int | None = None
+        prestaged_result: ExpertWeightResult | None = None
+        if async_staging_ready and not bulk_prefill:
+            for i, (kind, _, expert_ids) in enumerate(execution_groups):
+                if kind == "primary" and not provider.group_is_resident(expert_ids):
+                    prestaged_execution_index = i
+                    prestaged_result = provider.prepare_staged_group(
+                        expert_ids,
+                        0,
+                        wait_for_ready=False,
+                    )
+                    break
 
         # Accumulate in fp32. It does not recover what each group already lost
         # rounding to the model dtype, but it keeps the sum from losing more.
         accumulator: torch.Tensor | None = None
         out_dtype: torch.dtype | None = None
-        for i, expert_ids in enumerate(groups):
-            staged = provider.async_staging_enabled
-            result = (
-                provider.prepare_staged_group(expert_ids, i)
-                if staged
-                else provider.prepare(topk_ids, expert_ids)
+        staged_group_index = 0
+        for i, (kind, borrowed_bank, expert_ids) in enumerate(execution_groups):
+            resident = kind != "primary" or provider.group_is_resident(expert_ids)
+            staged = (
+                async_staging_ready and not bulk_prefill and not resident
             )
-            part = run(result, _ALL_ROWS, i == 0)
+            result = (
+                provider.prepare_borrowed_group(expert_ids, borrowed_bank)
+                if kind == "borrowed" and borrowed_bank is not None
+                else (
+                    lookahead[1]
+                    if kind == "lookahead" and lookahead is not None
+                    else (
+                        provider.prepare_bulk_prefill_group(i)
+                        if bulk_prefill
+                        else (
+                            (
+                                prestaged_result
+                                if i == prestaged_execution_index
+                                else provider.prepare_staged_group(
+                                    expert_ids, staged_group_index
+                                )
+                            )
+                            if staged
+                            else provider.prepare(topk_ids, expert_ids)
+                        )
+                    )
+                )
+            )
+            if kind == "lookahead":
+                provider.wait_lookahead_group()
+            if staged and i == prestaged_execution_index:
+                assert prestaged_result is not None
+                provider.wait_staged_group(staged_group_index)
+            part = run_and_release(result, _ALL_ROWS, i == 0)
+            if kind == "lookahead":
+                provider.release_lookahead_group()
             if staged:
-                provider.release_staged_group(i)
+                provider.release_staged_group(staged_group_index)
+                staged_group_index += 1
             if accumulator is None:
                 accumulator, out_dtype = part.float(), part.dtype
             else:
                 accumulator += part.float()
         assert accumulator is not None and out_dtype is not None
-        return accumulator.to(out_dtype)
+        return finish_forward(accumulator.to(out_dtype))
 
     plan = provider.plan_chunks(topk_ids)
     if len(plan) == 1:
         rows, unique_ids = plan[0]
-        return run(provider.prepare(topk_ids, unique_ids), rows, True)
-    return torch.cat(
-        [
-            run(provider.prepare(topk_ids[rows], unique_ids), rows, True)
-            for rows, unique_ids in plan
-        ],
-        dim=0,
+        return finish_forward(
+            run_and_release(
+                provider.prepare(topk_ids, unique_ids), rows, True
+            )
+        )
+    return finish_forward(
+        torch.cat(
+            [
+                run_and_release(
+                    provider.prepare(topk_ids[rows], unique_ids), rows, True
+                )
+                for rows, unique_ids in plan
+            ],
+            dim=0,
+        )
     )

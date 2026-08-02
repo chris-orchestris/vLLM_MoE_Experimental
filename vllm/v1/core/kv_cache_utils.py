@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_dcp_world_size,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -632,8 +633,8 @@ def resolve_kv_cache_block_sizes(
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
       ``cache_config.block_size * dcp``. Multiple groups: LCM of every
-      group's effective block size. Attention groups are scaled by DCP;
-      Mamba groups keep their full per-rank state and are not scaled.
+      group's effective block size. Full-attention groups are scaled by DCP;
+      sliding-window and state-space groups remain replicated and unscaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
@@ -647,13 +648,15 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        effective_dcp = get_kv_cache_spec_dcp_world_size(
+            groups[0].kv_cache_spec, dcp
+        )
+        bs = cache_config.block_size * effective_dcp
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
+        g.kv_cache_spec.block_size
+        * get_kv_cache_spec_dcp_world_size(g.kv_cache_spec, dcp)
         for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)

@@ -205,7 +205,7 @@ def _allocate_kv_cache(
     assert layer_names == (kv_cache_raw_tensors.keys() | shared_layers.keys()), (
         "Some layers are not correctly initialized"
     )
-    return kv_cache_raw_tensors
+    return kv_cache_raw_tensors, packed_backing
 
 
 def _reshape_attention_kv_cache(
@@ -462,7 +462,7 @@ def init_kv_cache(
     vllm_config: VllmConfig,
 ) -> dict[str, Any]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
-    kv_cache_raw_tensors = _allocate_kv_cache(
+    kv_cache_raw_tensors, packed_backing = _allocate_kv_cache(
         kv_cache_config, shared_kv_cache_layers, device
     )
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
@@ -483,7 +483,7 @@ def init_kv_cache(
         else 1
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
-    return kv_caches
+    return kv_caches, packed_backing
 
 
 def build_slot_mappings_by_layer(

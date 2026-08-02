@@ -39,6 +39,10 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.kv_tail_expert_cache import (
+    attach_kv_tail_expert_cache,
+    maybe_disable_kv_tail_expert_cache,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -539,7 +543,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
+        kv_caches_dict, packed_backing = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
@@ -548,6 +552,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             self.kernel_block_sizes,
             self.vllm_config,
+        )
+        self.kv_tail_expert_cache = attach_kv_tail_expert_cache(
+            self.model, packed_backing, self.kv_cache_config
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -1226,6 +1233,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            maybe_disable_kv_tail_expert_cache(
+                self.kv_tail_expert_cache,
+                scheduler_output,
+            )
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)

@@ -3,6 +3,7 @@
 """Fused MoE utilities for GPTQ."""
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
@@ -52,6 +53,38 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _read_marlin_moe_exec_config(prefix: str) -> dict[str, int]:
+    """Read an optional, per-GEMM Marlin launch override.
+
+    Keeping this at module import time avoids putting environment parsing on
+    the hot path.  An unset configuration preserves Marlin's auto selector.
+    """
+    thread_k = int(os.environ.get(f"{prefix}_THREAD_K", "-1"))
+    thread_n = int(os.environ.get(f"{prefix}_THREAD_N", "-1"))
+    blocks_per_sm = int(os.environ.get(f"{prefix}_BLOCKS_PER_SM", "-1"))
+    if (thread_k == -1) != (thread_n == -1):
+        raise ValueError(
+            f"{prefix}_THREAD_K and {prefix}_THREAD_N must both be set or unset"
+        )
+    if thread_k != -1 and (thread_k <= 0 or thread_n <= 0):
+        raise ValueError(f"{prefix} thread dimensions must be positive")
+    if blocks_per_sm != -1 and blocks_per_sm <= 0:
+        raise ValueError(f"{prefix}_BLOCKS_PER_SM must be positive")
+    return {
+        "thread_k": thread_k,
+        "thread_n": thread_n,
+        "blocks_per_sm": blocks_per_sm,
+    }
+
+
+_MARLIN_MOE_GEMM1_EXEC_CONFIG = _read_marlin_moe_exec_config(
+    "VLLM_MARLIN_MOE_GEMM1"
+)
+_MARLIN_MOE_GEMM2_EXEC_CONFIG = _read_marlin_moe_exec_config(
+    "VLLM_MARLIN_MOE_GEMM2"
+)
 
 
 def _fused_marlin_moe(
@@ -161,6 +194,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        **_MARLIN_MOE_GEMM1_EXEC_CONFIG,
     )
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
@@ -219,6 +253,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        **_MARLIN_MOE_GEMM2_EXEC_CONFIG,
     )
 
     return output

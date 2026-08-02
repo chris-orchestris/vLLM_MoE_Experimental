@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import math
+import os
 import threading
 import time
 from collections import defaultdict
@@ -166,6 +168,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_dcp_world_size,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -701,6 +704,7 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
+        self._init_dcp_world_sizes = [self.dcp_world_size]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -728,6 +732,7 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
+            dcp_world_sizes=self._init_dcp_world_sizes,
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -2561,6 +2566,14 @@ class GPUModelRunner(
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
+            # Local-window cache groups are replicated across DCP ranks.  Do
+            # not expose rank-local sequence lengths to their metadata
+            # builders: their block table and slot mapping cover the complete
+            # token stream on every rank.
+            if self._init_dcp_world_sizes[kv_cache_gid] == 1:
+                cm.dcp_local_seq_lens = None
+                cm.dcp_local_seq_lens_cpu = None
+
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
@@ -4173,6 +4186,8 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        self._maybe_disable_kv_tail_expert_cache(scheduler_output)
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -7246,6 +7261,7 @@ class GPUModelRunner(
         block_sizes = []
         max_num_blocks = []
         slot_mapping_modes = []
+        dcp_world_sizes = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -7262,17 +7278,24 @@ class GPUModelRunner(
                 self.vllm_config, max_model_len
             )
             max_num_blocks.append(max_num_blocks_per_req)
+            dcp_world_sizes.append(
+                get_kv_cache_spec_dcp_world_size(
+                    kv_cache_spec, self.dcp_world_size
+                )
+            )
 
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
+            or dcp_world_sizes != self._init_dcp_world_sizes
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
+            self._init_dcp_world_sizes = dcp_world_sizes
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -7290,6 +7313,7 @@ class GPUModelRunner(
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
                 slot_mapping_modes=slot_mapping_modes,
+                dcp_world_sizes=dcp_world_sizes,
             )
 
         assert self._init_block_sizes == block_sizes, (
@@ -7299,6 +7323,10 @@ class GPUModelRunner(
         assert self._init_kernel_block_sizes == kernel_block_sizes, (
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
+        )
+        assert self._init_dcp_world_sizes == dcp_world_sizes, (
+            f"InputBatch dcp_world_sizes {self._init_dcp_world_sizes} "
+            f"!= KV cache DCP sizes {dcp_world_sizes}"
         )
 
     def _allocate_kv_cache_tensors(
@@ -7333,6 +7361,8 @@ class GPUModelRunner(
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
+        self._packed_kv_cache_backing = packed_backing
+
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
@@ -7343,6 +7373,130 @@ class GPUModelRunner(
             "Some layers are not correctly initialized"
         )
         return kv_cache_raw_tensors
+
+    def _attach_kv_tail_expert_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """Carve an auxiliary expert bank from never-yet-used high KV blocks.
+
+        BlockPool allocates physical block IDs from low to high. The worker can
+        therefore use the untouched tail as expert-cache storage until the
+        scheduler first allocates a block in that range. execute_model checks
+        that boundary before block zeroing or model execution and permanently
+        disables the auxiliary bank when it is reached, preserving the full
+        configured context ceiling.
+        """
+        capacity = int(os.getenv("VLLM_MOE_KV_TAIL_CACHE_SIZE", "0"))
+        if capacity <= 0:
+            return
+        min_tokens = int(
+            os.getenv("VLLM_MOE_KV_TAIL_CACHE_MIN_TOKENS", "4096")
+        )
+        if min_tokens < 0:
+            raise ValueError("VLLM_MOE_KV_TAIL_CACHE_MIN_TOKENS must be >= 0")
+
+        backing = getattr(self, "_packed_kv_cache_backing", None)
+        if backing is None:
+            raise RuntimeError(
+                "KV-tail expert cache requires the packed DeepSeek V4 KV layout"
+            )
+        block_strides = {
+            tensor.block_stride
+            for tensor in kv_cache_config.kv_cache_tensors
+            if tensor.block_stride > 0
+        }
+        if len(block_strides) != 1:
+            raise RuntimeError(
+                "KV-tail expert cache requires one packed KV block stride"
+            )
+        block_stride = next(iter(block_strides))
+
+        providers = []
+        seen_provider_ids: set[int] = set()
+        for module in self.model.modules():
+            provider = getattr(module, "expert_weight_provider", None)
+            if provider is None or id(provider) in seen_provider_ids:
+                continue
+            seen_provider_ids.add(id(provider))
+            providers.append(provider)
+        providers.sort(key=lambda provider: provider.name)
+        if not providers:
+            raise RuntimeError("KV-tail expert cache found no cached MoE providers")
+
+        alignment = 256
+
+        def align(value: int) -> int:
+            return (value + alignment - 1) // alignment * alignment
+
+        layouts: list[list[tuple[torch.dtype, tuple[int, ...], int]]] = []
+        required_bytes = 0
+        for provider in providers:
+            provider_layout = []
+            for dtype, shape in provider.borrowed_tensor_specs(capacity):
+                item_size = torch.empty((), dtype=dtype).element_size()
+                tensor_bytes = math.prod(shape) * item_size
+                required_bytes = align(required_bytes)
+                provider_layout.append((dtype, shape, tensor_bytes))
+                required_bytes += tensor_bytes
+            layouts.append(provider_layout)
+        required_bytes = align(required_bytes)
+
+        borrowed_blocks = (required_bytes + block_stride - 1) // block_stride
+        fence_block = kv_cache_config.num_blocks - borrowed_blocks
+        if fence_block <= 1:
+            raise RuntimeError(
+                "KV-tail expert cache would consume all usable KV blocks: "
+                f"need {borrowed_blocks} of {kv_cache_config.num_blocks}"
+            )
+        tail_start = fence_block * block_stride
+        if tail_start + required_bytes > backing.numel():
+            raise RuntimeError("KV-tail expert cache layout exceeds packed backing")
+
+        cursor = tail_start
+        for provider, provider_layout in zip(providers, layouts):
+            buffers = []
+            for dtype, shape, tensor_bytes in provider_layout:
+                cursor = align(cursor)
+                raw = backing.narrow(0, cursor, tensor_bytes)
+                buffers.append(raw.view(dtype).view(shape))
+                cursor += tensor_bytes
+            provider.attach_borrowed_buffers(buffers, min_tokens=min_tokens)
+
+        self._kv_tail_expert_cache_fence = fence_block
+        self._kv_tail_expert_cache_providers = providers
+        self._kv_tail_expert_cache_active = True
+        logger.info(
+            "KV-tail expert cache attached: %d providers x %d experts, "
+            "%d bytes across %d high blocks; fence block=%d/%d",
+            len(providers),
+            capacity,
+            required_bytes,
+            borrowed_blocks,
+            fence_block,
+            kv_cache_config.num_blocks,
+        )
+
+    def _maybe_disable_kv_tail_expert_cache(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if not getattr(self, "_kv_tail_expert_cache_active", False):
+            return
+        new_block_ids = scheduler_output.new_block_ids_to_zero or []
+        fence_block = self._kv_tail_expert_cache_fence
+        if not any(block_id >= fence_block for block_id in new_block_ids):
+            return
+
+        # This runs before _update_states() zeroes new KV blocks. No new MoE
+        # launch can reference the tail after these metadata switches, while
+        # normal stream ordering protects any work from the preceding step.
+        for provider in self._kv_tail_expert_cache_providers:
+            provider.disable_borrowed_buffers()
+        self._kv_tail_expert_cache_active = False
+        logger.warning(
+            "KV allocation reached block %d (tail fence %d); permanently "
+            "disabled the borrowed expert bank while retaining the full KV "
+            "allocation.",
+            max(new_block_ids),
+            fence_block,
+        )
 
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
         return itertools.chain.from_iterable(self.attn_groups)
@@ -7651,6 +7805,8 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if not is_profiling:
+            self._attach_kv_tail_expert_cache(kv_cache_config)
 
         if (
             self.speculative_config

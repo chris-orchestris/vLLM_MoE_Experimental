@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import time
+
 import torch
 
 import vllm.envs as envs
@@ -20,7 +23,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     ExpertWeightResult,
+    registered_host_empty,
     run_with_expert_cache,
+    write_combined_host_empty,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
@@ -714,6 +719,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         num_experts = w13.shape[0]
         batch_size = min(32, num_experts)
         outputs: list[torch.Tensor | None] = [None, None, None, None]
+        write_combined_backing = (
+            os.environ.get(
+                "VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED_BACKING", "0"
+            )
+            == "1"
+        )
+        # Write-combined pages are intentionally optimized for CPU writes and
+        # GPU reads; direct GPU writes into them are pathologically slow on
+        # this PCIe host. Reuse one normal pinned batch per output for the
+        # one-time D2H repack, then memcpy from CPU into the persistent WC
+        # backing. Runtime expert loads retain the desired WC -> GPU direction.
+        repack_staging: list[torch.Tensor | None] = [None, None, None, None]
+        wc_allocation_seconds = 0.0
+        wc_gpu_repack_seconds = 0.0
+        wc_cpu_fill_seconds = 0.0
+        wc_setup_started = time.perf_counter()
 
         for start in range(0, num_experts, batch_size):
             stop = min(start + batch_size, num_experts)
@@ -737,15 +758,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 assert isinstance(tensor, torch.Tensor)
                 output = outputs[index]
                 if output is None:
-                    output = torch.empty(
-                        num_experts,
-                        *tensor.shape[1:],
-                        dtype=tensor.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
+                    shape = (num_experts, *tensor.shape[1:])
+                    if write_combined_backing:
+                        allocation_started = time.perf_counter()
+                        output = write_combined_host_empty(
+                            *shape,
+                            dtype=tensor.dtype,
+                        )
+                        wc_allocation_seconds += (
+                            time.perf_counter() - allocation_started
+                        )
+                    elif (
+                        os.environ.get(
+                            "VLLM_MOE_EXPERT_CACHE_REGISTERED_BACKING", "0"
+                        )
+                        == "1"
+                    ):
+                        output = registered_host_empty(
+                            *shape,
+                            dtype=tensor.dtype,
+                        )
+                    else:
+                        output = torch.empty(
+                            *shape,
+                            dtype=tensor.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
                     outputs[index] = output
-                output[start:stop].copy_(tensor, non_blocking=False)
+                if write_combined_backing:
+                    staging = repack_staging[index]
+                    if staging is None:
+                        staging = torch.empty(
+                            batch_size,
+                            *tensor.shape[1:],
+                            dtype=tensor.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        repack_staging[index] = staging
+                    staging_view = staging[: tensor.size(0)]
+                    gpu_repack_started = time.perf_counter()
+                    staging_view.copy_(tensor, non_blocking=False)
+                    wc_gpu_repack_seconds += (
+                        time.perf_counter() - gpu_repack_started
+                    )
+                    cpu_fill_started = time.perf_counter()
+                    output[start:stop].copy_(staging_view)
+                    wc_cpu_fill_seconds += time.perf_counter() - cpu_fill_started
+                else:
+                    output[start:stop].copy_(tensor, non_blocking=False)
 
             del staged, converted
 
@@ -756,6 +818,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         assert isinstance(repacked_w2, torch.Tensor)
         assert isinstance(repacked_w13_scale, torch.Tensor)
         assert isinstance(repacked_w2_scale, torch.Tensor)
+        if write_combined_backing:
+            logger.info(
+                "WC expert repack timing for %s: total=%.3fs alloc=%.3fs "
+                "gpu_repack_d2h=%.3fs cpu_fill=%.3fs",
+                layer.layer_name,
+                time.perf_counter() - wc_setup_started,
+                wc_allocation_seconds,
+                wc_gpu_repack_seconds,
+                wc_cpu_fill_seconds,
+            )
 
         replace_parameter(layer, "w13_weight", repacked_w13)
         replace_parameter(layer, "w2_weight", repacked_w2)
@@ -1039,6 +1111,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 result: ExpertWeightResult, rows: slice, include_shared: bool
             ) -> torch.Tensor:
                 assert self.moe_kernel is not None
+                if result.w1_scale is not None:
+                    # Expert-cache staging can return weights and scales from
+                    # alternating shared banks. Marlin keeps its scale tensors
+                    # on the experts object rather than accepting them through
+                    # apply(), so update the binding for every cache result.
+                    # The CUDA op captures the data pointers synchronously at
+                    # launch; the next group/request will bind its own result.
+                    assert result.w2_scale is not None
+                    fused_experts = self.moe_kernel.fused_experts
+                    fused_experts.quant_config._w1.scale = result.w1_scale
+                    fused_experts.quant_config._w2.scale = result.w2_scale
                 return self.moe_kernel.apply(
                     hidden_states=x[rows],
                     w1=result.w1,

@@ -564,6 +564,13 @@ class SlidingWindowSpec(AttentionSpec):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
 
+    def max_num_blocks_per_req(
+        self, vllm_config: VllmConfig, max_len: int
+    ) -> int:
+        # Unlike full attention, sliding-window KV is replicated across DCP
+        # ranks, so its worker-side block table covers global token positions.
+        return cdiv(max_len, self.block_size)
+
     @property
     def real_page_size_bytes(self) -> int:
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
@@ -608,9 +615,11 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        # Sliding-window KV is deliberately replicated under DCP.  DCP only
+        # shards cache specs whose attention backend consumes rank-local
+        # context (FullAttentionSpec); local-window backends still process the
+        # complete token stream on every rank.  Consequently this group's
+        # admission bound must not be divided by the global DCP world size.
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -855,6 +864,18 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
         return max_num_pages * self.page_size_bytes
 
+    def max_num_blocks_per_req(
+        self, vllm_config: VllmConfig, max_len: int
+    ) -> int:
+        # Keep worker block-table sizing consistent with the representative
+        # per-layer spec used by the scheduler.  This matters for DeepSeek V4,
+        # whose worker config retains this aggregate wrapper while the
+        # scheduler config unwraps it.
+        return max(
+            spec.max_num_blocks_per_req(vllm_config, max_len)
+            for spec in self.kv_cache_specs.values()
+        )
+
     @classmethod
     def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
         """
@@ -896,6 +917,32 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
             for spec in self.kv_cache_specs.values()
         )
+
+
+def get_kv_cache_spec_dcp_world_size(
+    kv_cache_spec: KVCacheSpec, dcp_world_size: int
+) -> int:
+    """Return the DCP shard count that applies to one KV cache group.
+
+    Full-attention KV is distributed across DCP ranks.  Sliding-window,
+    chunked-local, and state-space caches remain replicated, so their
+    effective cache DCP size is one even when the model's global DCP group is
+    larger.  DeepSeek V4 worker configs wrap homogeneous per-layer specs in
+    :class:`UniformTypeKVCacheSpecs`; recurse through that wrapper and reject a
+    malformed mixed group instead of silently choosing an unsafe layout.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        effective_sizes = {
+            get_kv_cache_spec_dcp_world_size(spec, dcp_world_size)
+            for spec in kv_cache_spec.kv_cache_specs.values()
+        }
+        if len(effective_sizes) != 1:
+            raise ValueError(
+                "A UniformTypeKVCacheSpecs group mixes DCP-sharded and "
+                "replicated cache specs. Split it into homogeneous groups."
+            )
+        return effective_sizes.pop()
+    return dcp_world_size if isinstance(kv_cache_spec, FullAttentionSpec) else 1
 
 
 def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
