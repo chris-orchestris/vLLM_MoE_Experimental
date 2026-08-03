@@ -9,14 +9,17 @@ import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Literal
 
+import numpy as np
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
@@ -24,10 +27,88 @@ _STATS_LOG_INTERVAL = 64
 
 _BATCH_COPY_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _EXCLUSIVE_SWAP_FUNCTIONS: dict[str, Callable[..., int]] = {}
+_PACKED_SCALE_GATHER_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _REGISTERED_HOST_ALLOCATIONS: list[tuple[mmap.mmap, int, int]] = []
 _WRITE_COMBINED_HOST_ALLOCATIONS: list[tuple[ctypes.c_void_p, object]] = []
 _MAPPED_TENSOR_EXTENSION: ModuleType | None = None
 _MAPPED_TENSOR_CUDART: ctypes.CDLL | None = None
+
+
+@dataclass
+class _PackedScaleTransferScratch:
+    packed_rows: torch.Tensor
+    packed_host_rows: torch.Tensor
+    source_hosts: torch.Tensor
+    slot_hosts: torch.Tensor
+    slot_devices: torch.Tensor
+    events: list[torch.Event | None]
+    cursor: int = 0
+
+
+@dataclass
+class _PackedScaleHostArena:
+    backing: torch.Tensor
+    next_layer: int = 0
+
+
+_PACKED_SCALE_SCRATCH: dict[tuple[int, int, int, int], _PackedScaleTransferScratch] = {}
+_PACKED_SCALE_HOST_ARENAS: dict[tuple[int, int, int], _PackedScaleHostArena] = {}
+
+
+@triton.jit
+def _unpack_expert_scales_kernel(
+    packed_rows,
+    destination_slots,
+    w13_scale,
+    w2_scale,
+    packed_stride,
+    w13_stride,
+    w2_stride,
+    w13_values: tl.constexpr,
+    w2_values: tl.constexpr,
+    w13_payload_bytes: tl.constexpr,
+    block: tl.constexpr,
+):
+    """Expand lossless base-plus-3-bit scale rows on the active CUDA stream."""
+    source_row = tl.program_id(1)
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    total_values = w13_values + w2_values
+    valid = offsets < total_values
+    is_w13 = offsets < w13_values
+    local_offsets = tl.where(is_w13, offsets, offsets - w13_values)
+
+    packed_row = packed_rows + source_row * packed_stride
+    payload_offsets = tl.where(is_w13, 2, 2 + w13_payload_bytes)
+    bit_offsets = local_offsets * 3
+    byte_offsets = bit_offsets // 8
+    shifts = bit_offsets % 8
+    low = tl.load(
+        packed_row + payload_offsets + byte_offsets,
+        mask=valid,
+        other=0,
+    ).to(tl.uint32)
+    high = tl.load(
+        packed_row + payload_offsets + byte_offsets + 1,
+        mask=valid,
+        other=0,
+    ).to(tl.uint32)
+    base = tl.where(
+        is_w13,
+        tl.load(packed_row),
+        tl.load(packed_row + 1),
+    ).to(tl.uint32)
+    values = (((low | (high << 8)) >> shifts) & 7) + base
+    destination_slot = tl.load(destination_slots + source_row)
+    tl.store(
+        w13_scale + destination_slot * w13_stride + offsets,
+        values.to(tl.uint8),
+        mask=valid & is_w13,
+    )
+    tl.store(
+        w2_scale + destination_slot * w2_stride + local_offsets,
+        values.to(tl.uint8),
+        mask=valid & ~is_w13,
+    )
 
 
 def _mapped_cuda_alias(host_tensor: torch.Tensor) -> torch.Tensor:
@@ -140,6 +221,25 @@ def _load_exclusive_swap_function(library_path: str) -> Callable[..., int]:
     return function
 
 
+def _load_packed_scale_gather_function(library_path: str) -> Callable[..., int]:
+    function = _PACKED_SCALE_GATHER_FUNCTIONS.get(library_path)
+    if function is not None:
+        return function
+
+    library = ctypes.CDLL(library_path)
+    function = library.vllm_cpu_gather_u8_rows
+    function.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    function.restype = ctypes.c_int
+    _PACKED_SCALE_GATHER_FUNCTIONS[library_path] = function
+    return function
+
+
 def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     """Pinned CPU copy of *src* with exactly one cross-device transfer.
 
@@ -152,6 +252,50 @@ def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     dst = torch.empty_like(src, device="cpu", pin_memory=True)
     dst.copy_(src)
     return dst
+
+
+def _pack_three_bit_scale_matrix(
+    source: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one uint8 base and a lossless 3-bit payload for every row."""
+    if source.element_size() != 1:
+        raise ValueError("packed expert scales require one-byte E8M0 scale tensors")
+    host = source.detach()
+    if host.device.type != "cpu":
+        host = host.cpu()
+    host_bytes = host.contiguous().view(torch.uint8)
+    values = np.asarray(host_bytes.numpy()).reshape(host.size(0), -1)
+    bases = values.min(axis=1).astype(np.uint8, copy=False)
+    spans = values.max(axis=1).astype(np.int16) - bases.astype(np.int16)
+    worst_span = int(spans.max())
+    if worst_span > 7:
+        raise ValueError(
+            "packed expert scales require every row to span at most eight "
+            f"consecutive uint8 values; observed span {worst_span}"
+        )
+    deltas = values - bases[:, None]
+    value_count = values.shape[1]
+    padded_count = (value_count + 7) // 8 * 8
+    if padded_count != value_count:
+        padded = np.zeros((values.shape[0], padded_count), dtype=np.uint8)
+        padded[:, :value_count] = deltas
+        deltas = padded
+    groups = deltas.reshape(values.shape[0], -1, 8)
+    packed = np.empty((values.shape[0], groups.shape[1], 3), dtype=np.uint8)
+    packed[:, :, 0] = (
+        groups[:, :, 0] | (groups[:, :, 1] << 3) | ((groups[:, :, 2] & 3) << 6)
+    )
+    packed[:, :, 1] = (
+        (groups[:, :, 2] >> 2)
+        | (groups[:, :, 3] << 1)
+        | (groups[:, :, 4] << 4)
+        | ((groups[:, :, 5] & 1) << 7)
+    )
+    packed[:, :, 2] = (
+        (groups[:, :, 5] >> 1) | (groups[:, :, 6] << 2) | (groups[:, :, 7] << 5)
+    )
+    payload_bytes = (value_count * 3 + 7) // 8
+    return bases, packed.reshape(values.shape[0], -1)[:, :payload_bytes]
 
 
 def registered_host_empty(
@@ -591,10 +735,18 @@ class CachedWeightProvider:
         self._mapped_scales = os.getenv(
             "VLLM_MOE_EXPERT_CACHE_MAPPED_SCALES", "0"
         ).lower() in {"1", "true"}
+        packed_scales_requested = exclusive or os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_PACKED_SCALES", "0"
+        ).lower() in {"1", "true"}
+        self._packed_scales = (
+            w13_scale is not None and w2_scale is not None and packed_scales_requested
+        )
         if exclusive and self._mapped_scales:
             raise ValueError(
                 "exclusive expert caching is incompatible with mapped scales"
             )
+        if self._packed_scales and self._mapped_scales:
+            raise ValueError("packed expert scales are incompatible with mapped scales")
         if exclusive and self._bulk_prefill_min_tokens > 0:
             raise ValueError(
                 "exclusive expert caching is incompatible with the bulk-prefill "
@@ -637,15 +789,31 @@ class CachedWeightProvider:
             device=cuda_device,
         )
 
+        self._packed_scale_backing: torch.Tensor | None = None
+        self._packed_scale_w13_values = 0
+        self._packed_scale_w2_values = 0
+        self._packed_scale_w13_payload_bytes = 0
+        self._packed_scale_row_bytes = 0
+        self._packed_scale_gather_function: Callable[..., int] | None = None
+
         if w13_scale is not None and w2_scale is not None:
             # Pinned for the same reason the weights are: these are copied on
             # every miss, and pageable source memory forces a staging copy.
-            self._cpu_w13_scale: torch.Tensor | None = (
-                w13_scale if exclusive else _pinned_cpu_copy(w13_scale)
-            )
-            self._cpu_w2_scale: torch.Tensor | None = (
-                w2_scale if exclusive else _pinned_cpu_copy(w2_scale)
-            )
+            if self._packed_scales:
+                self._cpu_w13_scale = None
+                self._cpu_w2_scale = None
+                self._initialize_packed_scale_backing(
+                    w13_scale,
+                    w2_scale,
+                    cuda_device,
+                )
+            else:
+                self._cpu_w13_scale = (
+                    w13_scale if exclusive else _pinned_cpu_copy(w13_scale)
+                )
+                self._cpu_w2_scale = (
+                    w2_scale if exclusive else _pinned_cpu_copy(w2_scale)
+                )
             if self._mapped_scales:
                 default_banks = math.ceil(num_experts / capacity)
                 mapped_scale_banks = int(
@@ -871,12 +1039,243 @@ class CachedWeightProvider:
                 if self._lookahead_registry_key is not None:
                     _INTERLAYER_PROVIDERS[self._lookahead_registry_key] = self
 
+    def _initialize_packed_scale_backing(
+        self,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        cuda_device: torch.device,
+    ) -> None:
+        """Replace full uint8 host scales with lossless 3-bit pageable rows."""
+        w13_bases, w13_payloads = _pack_three_bit_scale_matrix(w13_scale)
+        w2_bases, w2_payloads = _pack_three_bit_scale_matrix(w2_scale)
+        if w13_payloads.shape[0] != self._num_experts:
+            raise ValueError("packed W13 scale expert count is inconsistent")
+        if w2_payloads.shape[0] != self._num_experts:
+            raise ValueError("packed W2 scale expert count is inconsistent")
+
+        self._packed_scale_w13_values = w13_scale[0].numel()
+        self._packed_scale_w2_values = w2_scale[0].numel()
+        self._packed_scale_w13_payload_bytes = w13_payloads.shape[1]
+        # One final guard byte makes the kernel's cross-byte uint16 load safe.
+        self._packed_scale_row_bytes = (
+            2 + w13_payloads.shape[1] + w2_payloads.shape[1] + 1
+        )
+        default_arena_layers = "46" if self.exclusive else "0"
+        arena_layers = int(
+            os.getenv("VLLM_MOE_PACKED_SCALE_ARENA_LAYERS", default_arena_layers)
+        )
+        if arena_layers < 0:
+            raise ValueError("VLLM_MOE_PACKED_SCALE_ARENA_LAYERS must be >= 0")
+        if arena_layers:
+            device_index = cuda_device.index
+            if device_index is None:
+                device_index = torch.accelerator.current_device_index()
+            arena_key = (
+                device_index,
+                self._num_experts,
+                self._packed_scale_row_bytes,
+            )
+            arena = _PACKED_SCALE_HOST_ARENAS.get(arena_key)
+            if arena is None:
+                arena = _PackedScaleHostArena(
+                    backing=torch.empty(
+                        arena_layers,
+                        self._num_experts,
+                        self._packed_scale_row_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                    )
+                )
+                _PACKED_SCALE_HOST_ARENAS[arena_key] = arena
+                logger.info_once(
+                    "Preallocated one %.2f GiB pageable arena for %d packed "
+                    "expert-scale layers per rank.",
+                    arena.backing.numel() / (1 << 30),
+                    arena_layers,
+                    scope="global",
+                )
+            elif arena.backing.size(0) != arena_layers:
+                raise ValueError(
+                    "packed expert-scale arena capacity changed within one process"
+                )
+            if arena.next_layer >= arena.backing.size(0):
+                raise RuntimeError(
+                    "packed expert-scale arena is full; increase "
+                    "VLLM_MOE_PACKED_SCALE_ARENA_LAYERS"
+                )
+            backing = arena.backing[arena.next_layer]
+            arena.next_layer += 1
+            backing.zero_()
+        else:
+            backing = torch.zeros(
+                self._num_experts,
+                self._packed_scale_row_bytes,
+                dtype=torch.uint8,
+                device="cpu",
+            )
+        backing[:, 0].copy_(torch.from_numpy(w13_bases))
+        backing[:, 1].copy_(torch.from_numpy(w2_bases))
+        w13_end = 2 + w13_payloads.shape[1]
+        backing[:, 2:w13_end].copy_(torch.from_numpy(w13_payloads))
+        backing[:, w13_end : w13_end + w2_payloads.shape[1]].copy_(
+            torch.from_numpy(w2_payloads)
+        )
+        self._packed_scale_backing = backing
+
+        original_bytes = self._num_experts * (
+            self._packed_scale_w13_values + self._packed_scale_w2_values
+        )
+        logger.info_once(
+            "Using lossless 3-bit expert-scale backing: %.2f MiB replaces "
+            "%.2f MiB per layer/rank (%.1f%% smaller).",
+            backing.numel() / (1 << 20),
+            original_bytes / (1 << 20),
+            100.0 * (1.0 - backing.numel() / original_bytes),
+            scope="global",
+        )
+
+    def _copy_packed_scales(
+        self,
+        destination_w13: torch.Tensor,
+        destination_w2: torch.Tensor,
+        copies: list[tuple[int, int]],
+    ) -> None:
+        """Upload and expand several packed scale rows with one GPU kernel."""
+        if not copies:
+            return
+        backing = self._packed_scale_backing
+        if backing is None:
+            raise RuntimeError("packed expert-scale backing is not initialized")
+        if len(copies) > self.capacity:
+            raise RuntimeError("packed expert-scale batch exceeds cache capacity")
+        if destination_w13.element_size() != 1 or destination_w2.element_size() != 1:
+            raise RuntimeError(
+                "packed expert-scale destinations must have one-byte elements"
+            )
+
+        destination_w13_bytes = destination_w13.view(torch.uint8)
+        destination_w2_bytes = destination_w2.view(torch.uint8)
+
+        stream = current_platform.current_stream(destination_w13_bytes.device)
+        device_index = destination_w13_bytes.device.index
+        assert device_index is not None
+        ring_count = int(os.getenv("VLLM_MOE_PACKED_SCALE_TRANSFER_SLOTS", "4"))
+        if ring_count <= 0:
+            raise ValueError("VLLM_MOE_PACKED_SCALE_TRANSFER_SLOTS must be > 0")
+        # A scratch allocation per CUDA stream is unexpectedly expensive here:
+        # exclusive mode owns one D2H stream per MoE layer, so 43 streams would
+        # strand roughly 145 MiB of device staging and more than 1 GiB of pinned
+        # host staging after the first cache sweep.  A small event-protected
+        # device-wide ring preserves cross-stream overlap without consuming the
+        # execution headroom needed by concurrent Ampere prefill.
+        scratch_key = (
+            device_index,
+            self.capacity,
+            self._packed_scale_row_bytes,
+            ring_count,
+        )
+        transfer = _PACKED_SCALE_SCRATCH.get(scratch_key)
+        if transfer is None:
+            transfer = _PackedScaleTransferScratch(
+                packed_rows=torch.empty(
+                    ring_count,
+                    self.capacity,
+                    self._packed_scale_row_bytes,
+                    dtype=torch.uint8,
+                    device=destination_w13_bytes.device,
+                ),
+                packed_host_rows=torch.empty(
+                    ring_count,
+                    self.capacity,
+                    self._packed_scale_row_bytes,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                source_hosts=torch.empty(
+                    ring_count,
+                    self.capacity,
+                    dtype=torch.int64,
+                    device="cpu",
+                ),
+                slot_hosts=torch.empty(
+                    ring_count,
+                    self.capacity,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                slot_devices=torch.empty(
+                    ring_count,
+                    self.capacity,
+                    dtype=torch.int32,
+                    device=destination_w13_bytes.device,
+                ),
+                events=[None] * ring_count,
+            )
+            _PACKED_SCALE_SCRATCH[scratch_key] = transfer
+
+        ring_index = transfer.cursor % transfer.slot_hosts.size(0)
+        transfer.cursor += 1
+        previous = transfer.events[ring_index]
+        if previous is not None:
+            previous.synchronize()
+        packed_rows = transfer.packed_rows[ring_index]
+        slot_host = transfer.slot_hosts[ring_index]
+        slot_device = transfer.slot_devices[ring_index]
+        packed_host_rows = transfer.packed_host_rows[ring_index]
+        source_host = transfer.source_hosts[ring_index]
+        for index, (destination_slot, expert_id) in enumerate(copies):
+            slot_host[index] = destination_slot
+            source_host[index] = expert_id
+        gather_function = self._packed_scale_gather_function
+        if gather_function is None:
+            np.take(
+                backing.numpy(),
+                source_host[: len(copies)].numpy(),
+                axis=0,
+                out=packed_host_rows[: len(copies)].numpy(),
+            )
+        else:
+            error = gather_function(
+                packed_host_rows.data_ptr(),
+                backing.data_ptr(),
+                source_host.data_ptr(),
+                self._packed_scale_row_bytes,
+                len(copies),
+            )
+            if error != 0:
+                raise RuntimeError("native packed-scale row gather failed")
+        packed_rows[: len(copies)].copy_(
+            packed_host_rows[: len(copies)], non_blocking=True
+        )
+        slot_device[: len(copies)].copy_(slot_host[: len(copies)], non_blocking=True)
+        total_values = self._packed_scale_w13_values + self._packed_scale_w2_values
+        grid = (triton.cdiv(total_values, 256), len(copies))
+        _unpack_expert_scales_kernel[grid](
+            packed_rows,
+            slot_device,
+            destination_w13_bytes,
+            destination_w2_bytes,
+            packed_rows.stride(0),
+            destination_w13_bytes.stride(0),
+            destination_w2_bytes.stride(0),
+            w13_values=self._packed_scale_w13_values,
+            w2_values=self._packed_scale_w2_values,
+            w13_payload_bytes=self._packed_scale_w13_payload_bytes,
+            block=256,
+            num_warps=4,
+        )
+        ready = previous if previous is not None else current_platform.Event()
+        ready.record(stream)
+        transfer.events[ring_index] = ready
+
     def _allocate_exclusive_host_tensor(
         self, source: torch.Tensor, host_rows: int
     ) -> torch.Tensor:
         shape = (host_rows, *source.shape[1:])
         registered = os.getenv(
-            "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_REGISTERED_BACKING", "0"
+            "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_REGISTERED_BACKING", "1"
         ).lower() in {"1", "true"}
         if registered:
             return registered_host_empty(*shape, dtype=source.dtype)
@@ -897,12 +1296,17 @@ class CachedWeightProvider:
         host_experts = self._num_experts - self.capacity
         host_rows = host_experts + 1
         sources = [self._cpu_w13, self._cpu_w2]
-        if self._cpu_w13_scale is not None:
+        # Packed scales are immutable and retain a compact row for every
+        # expert. They do not participate in exclusive ownership rotation:
+        # an incoming row is expanded directly into the new GPU spare, while
+        # an evicted row needs no scale D2H copy. This removes two transfers
+        # from every native swap and avoids a GPU->CPU repack dependency.
+        if self._cpu_w13_scale is not None and not self._packed_scales:
             assert self._cpu_w2_scale is not None
             sources.extend([self._cpu_w13_scale, self._cpu_w2_scale])
 
         gpu_tensors = [self._buf_w13, self._buf_w2]
-        if self._buf_w13_scale is not None:
+        if self._buf_w13_scale is not None and not self._packed_scales:
             assert self._buf_w2_scale is not None
             gpu_tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
 
@@ -910,6 +1314,15 @@ class CachedWeightProvider:
         for gpu_tensor, source in zip(gpu_tensors, sources):
             gpu_tensor[: self.capacity].copy_(
                 source[: self.capacity], non_blocking=True
+            )
+
+        if self._packed_scales:
+            assert self._buf_w13_scale is not None
+            assert self._buf_w2_scale is not None
+            self._copy_packed_scales(
+                self._buf_w13_scale,
+                self._buf_w2_scale,
+                [(expert_id, expert_id) for expert_id in range(self.capacity)],
             )
 
         compact = []
@@ -932,13 +1345,22 @@ class CachedWeightProvider:
         self._exclusive_host_spare = host_experts
         self._exclusive_gpu_spare = self.capacity
 
-        library_path = os.getenv("VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY")
-        if not library_path:
+        bundled_library = Path(__file__).with_name("cuda_expert_cache_helper.so")
+        library_path = os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY",
+            str(bundled_library),
+        )
+        if not Path(library_path).is_file():
             raise RuntimeError(
-                "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY must point to "
-                "the compiled exclusive expert-swap helper"
+                "exclusive expert caching requires the native helper at "
+                f"{library_path}; run tools/install_moe_experimental.sh or set "
+                "VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY"
             )
         self._exclusive_swap_function = _load_exclusive_swap_function(library_path)
+        if self._packed_scales:
+            self._packed_scale_gather_function = _load_packed_scale_gather_function(
+                library_path
+            )
         self._exclusive_h2d_stream = current_platform.Stream(device=cuda_device)
         self._exclusive_d2h_stream = current_platform.Stream(device=cuda_device)
         self._exclusive_h2d_done = current_platform.Event()
@@ -993,7 +1415,8 @@ class CachedWeightProvider:
             tensor.numel() * tensor.element_size() for tensor in compact
         )
         logger.info_once(
-            "Exclusive CPU/GPU expert cache enabled: %d GPU residents plus "
+            "Exclusive CPU/GPU expert cache with packed scales enabled: "
+            "%d GPU residents plus "
             "one GPU/CPU rotating spare; compact host backing saves %.2f GiB "
             "per compatible provider set before allocator overhead.",
             self.capacity,
@@ -1418,6 +1841,7 @@ class CachedWeightProvider:
 
         copy_stream = current_platform.current_stream(bank.w13.device)
         self._wait_for_exclusive_host_updates(copy_stream)
+        scale_copies: list[tuple[int, int]] = []
         for expert_id in expert_ids:
             if expert_id in bank.slots:
                 continue
@@ -1434,17 +1858,29 @@ class CachedWeightProvider:
                 non_blocking=True,
             )
             if bank.w13_scale is not None:
-                assert self._cpu_w13_scale is not None
-                assert self._cpu_w2_scale is not None
                 assert bank.w2_scale is not None
-                bank.w13_scale[slot].copy_(
-                    self._cpu_expert_row(self._cpu_w13_scale, expert_id),
-                    non_blocking=True,
-                )
-                bank.w2_scale[slot].copy_(
-                    self._cpu_expert_row(self._cpu_w2_scale, expert_id),
-                    non_blocking=True,
-                )
+                if self._packed_scales:
+                    scale_copies.append((slot, expert_id))
+                else:
+                    assert self._cpu_w13_scale is not None
+                    assert self._cpu_w2_scale is not None
+                    bank.w13_scale[slot].copy_(
+                        self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                        non_blocking=True,
+                    )
+                    bank.w2_scale[slot].copy_(
+                        self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                        non_blocking=True,
+                    )
+
+        if scale_copies:
+            assert bank.w13_scale is not None
+            assert bank.w2_scale is not None
+            self._copy_packed_scales(
+                bank.w13_scale,
+                bank.w2_scale,
+                scale_copies,
+            )
 
         bank.mapping_host.fill_(-1)
         for expert_id in expert_ids:
@@ -1561,6 +1997,7 @@ class CachedWeightProvider:
         with torch.cuda.stream(pool.copy_stream):
             self._wait_for_exclusive_host_updates(pool.copy_stream)
             pool.copy_stream.wait_event(pool.consumed[bank_index])
+            scale_copies: list[tuple[int, int]] = []
             for slot, expert_id in enumerate(expert_ids):
                 result.w1[slot].copy_(
                     self._cpu_expert_row(self._cpu_w13, expert_id),
@@ -1571,17 +2008,28 @@ class CachedWeightProvider:
                     non_blocking=True,
                 )
                 if result.w1_scale is not None:
-                    assert self._cpu_w13_scale is not None
-                    assert self._cpu_w2_scale is not None
                     assert result.w2_scale is not None
-                    result.w1_scale[slot].copy_(
-                        self._cpu_expert_row(self._cpu_w13_scale, expert_id),
-                        non_blocking=True,
-                    )
-                    result.w2_scale[slot].copy_(
-                        self._cpu_expert_row(self._cpu_w2_scale, expert_id),
-                        non_blocking=True,
-                    )
+                    if self._packed_scales:
+                        scale_copies.append((slot, expert_id))
+                    else:
+                        assert self._cpu_w13_scale is not None
+                        assert self._cpu_w2_scale is not None
+                        result.w1_scale[slot].copy_(
+                            self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                            non_blocking=True,
+                        )
+                        result.w2_scale[slot].copy_(
+                            self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                            non_blocking=True,
+                        )
+            if scale_copies:
+                assert result.w1_scale is not None
+                assert result.w2_scale is not None
+                self._copy_packed_scales(
+                    result.w1_scale,
+                    result.w2_scale,
+                    scale_copies,
+                )
             result.expert_map.copy_(mapping_host, non_blocking=True)
             self._record_exclusive_host_reads(pool.copy_stream)
             pool.ready[bank_index].record(pool.copy_stream)
@@ -1714,7 +2162,11 @@ class CachedWeightProvider:
 
         append_tensor_copies(self._buf_w13, self._cpu_w13)
         append_tensor_copies(self._buf_w2, self._cpu_w2)
-        if self._buf_w13_scale is not None and not self._mapped_scales:
+        if (
+            self._buf_w13_scale is not None
+            and not self._mapped_scales
+            and not self._packed_scales
+        ):
             assert self._cpu_w13_scale is not None
             assert self._cpu_w2_scale is not None
             assert self._buf_w2_scale is not None
@@ -1788,6 +2240,7 @@ class CachedWeightProvider:
             # created.
             pool.copy_stream.wait_event(pool.consumed[bank_index])
             self._wait_for_exclusive_host_updates(pool.copy_stream)
+            scale_copies: list[tuple[int, int]] = []
             for slot, expert_id in enumerate(unique_ids):
                 result.w1[slot].copy_(
                     self._cpu_expert_row(self._cpu_w13, expert_id),
@@ -1798,17 +2251,28 @@ class CachedWeightProvider:
                     non_blocking=True,
                 )
                 if result.w1_scale is not None:
-                    assert self._cpu_w13_scale is not None
-                    assert self._cpu_w2_scale is not None
                     assert result.w2_scale is not None
-                    result.w1_scale[slot].copy_(
-                        self._cpu_expert_row(self._cpu_w13_scale, expert_id),
-                        non_blocking=True,
-                    )
-                    result.w2_scale[slot].copy_(
-                        self._cpu_expert_row(self._cpu_w2_scale, expert_id),
-                        non_blocking=True,
-                    )
+                    if self._packed_scales:
+                        scale_copies.append((slot, expert_id))
+                    else:
+                        assert self._cpu_w13_scale is not None
+                        assert self._cpu_w2_scale is not None
+                        result.w1_scale[slot].copy_(
+                            self._cpu_expert_row(self._cpu_w13_scale, expert_id),
+                            non_blocking=True,
+                        )
+                        result.w2_scale[slot].copy_(
+                            self._cpu_expert_row(self._cpu_w2_scale, expert_id),
+                            non_blocking=True,
+                        )
+            if scale_copies:
+                assert result.w1_scale is not None
+                assert result.w2_scale is not None
+                self._copy_packed_scales(
+                    result.w1_scale,
+                    result.w2_scale,
+                    scale_copies,
+                )
             result.expert_map.copy_(mapping_host, non_blocking=True)
             self._record_exclusive_host_reads(pool.copy_stream)
             pool.ready[bank_index].record(pool.copy_stream)
@@ -1879,15 +2343,22 @@ class CachedWeightProvider:
                 self._cpu_w2[source_start:source_end], non_blocking=True
             )
         if self._buf_w13_scale is not None and not self._mapped_scales:
-            assert self._cpu_w13_scale is not None
-            assert self._cpu_w2_scale is not None
             assert self._buf_w2_scale is not None
-            self._buf_w13_scale[:count].copy_(
-                self._cpu_w13_scale[start:end], non_blocking=True
-            )
-            self._buf_w2_scale[:count].copy_(
-                self._cpu_w2_scale[start:end], non_blocking=True
-            )
+            if self._packed_scales:
+                self._copy_packed_scales(
+                    self._buf_w13_scale,
+                    self._buf_w2_scale,
+                    [(slot, expert_id) for slot, expert_id in enumerate(expert_ids)],
+                )
+            else:
+                assert self._cpu_w13_scale is not None
+                assert self._cpu_w2_scale is not None
+                self._buf_w13_scale[:count].copy_(
+                    self._cpu_w13_scale[start:end], non_blocking=True
+                )
+                self._buf_w2_scale[:count].copy_(
+                    self._cpu_w2_scale[start:end], non_blocking=True
+                )
 
         # The bulk upload overwrites every occupied slot. Keep the adaptive
         # cache metadata truthful so the next decode/short-prefill prepare()
@@ -2134,6 +2605,7 @@ class CachedWeightProvider:
 
         misses_to_copy: list[tuple[int, int]] = []
         exclusive_swaps: list[tuple[int, int, int, int]] = []
+        exclusive_scale_copies: list[tuple[int, int]] = []
         for expert_id in unique_ids:
             if expert_id in self._lru:
                 # Cache hit: update frequency and recency
@@ -2173,6 +2645,8 @@ class CachedWeightProvider:
                             expert_id, victim_id, victim_slot
                         )
                         exclusive_swaps.append(swap)
+                        if self._packed_scales:
+                            exclusive_scale_copies.append((slot, expert_id))
                     else:
                         slot = victim_slot
 
@@ -2193,8 +2667,28 @@ class CachedWeightProvider:
         if exclusive_swaps:
             self._queue_exclusive_swap_wave(exclusive_swaps)
             h2d_done = self._exclusive_h2d_done
+            d2h_done = self._exclusive_d2h_done
+            d2h_stream = self._exclusive_d2h_stream
             assert h2d_done is not None
-            current_platform.current_stream(self._buf_w13.device).wait_event(h2d_done)
+            assert d2h_done is not None
+            assert d2h_stream is not None
+            compute_stream = current_platform.current_stream(self._buf_w13.device)
+            if exclusive_scale_copies:
+                assert self._buf_w13_scale is not None
+                assert self._buf_w2_scale is not None
+                # The final D2H record means every destination slot is no
+                # longer read by its evicted expert. Expand immutable packed
+                # scales on that stream so the kernel can overlap the final
+                # large weight H2D on the opposite copy engine.
+                with torch.cuda.stream(d2h_stream):
+                    self._copy_packed_scales(
+                        self._buf_w13_scale,
+                        self._buf_w2_scale,
+                        exclusive_scale_copies,
+                    )
+                    d2h_done.record(d2h_stream)
+                compute_stream.wait_event(d2h_done)
+            compute_stream.wait_event(h2d_done)
 
         if (
             self._batched_copy_function is not None
@@ -2207,15 +2701,26 @@ class CachedWeightProvider:
                 self._buf_w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
                 self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
                 if self._buf_w13_scale is not None and not self._mapped_scales:
-                    assert self._cpu_w13_scale is not None
-                    assert self._cpu_w2_scale is not None
                     assert self._buf_w2_scale is not None
-                    self._buf_w13_scale[slot].copy_(
-                        self._cpu_w13_scale[expert_id], non_blocking=True
-                    )
-                    self._buf_w2_scale[slot].copy_(
-                        self._cpu_w2_scale[expert_id], non_blocking=True
-                    )
+                    if not self._packed_scales:
+                        assert self._cpu_w13_scale is not None
+                        assert self._cpu_w2_scale is not None
+                        self._buf_w13_scale[slot].copy_(
+                            self._cpu_w13_scale[expert_id], non_blocking=True
+                        )
+                        self._buf_w2_scale[slot].copy_(
+                            self._cpu_w2_scale[expert_id], non_blocking=True
+                        )
+
+        packed_scale_copies = [] if self.exclusive else misses_to_copy
+        if self._packed_scale_backing is not None and packed_scale_copies:
+            assert self._buf_w13_scale is not None
+            assert self._buf_w2_scale is not None
+            self._copy_packed_scales(
+                self._buf_w13_scale,
+                self._buf_w2_scale,
+                packed_scale_copies,
+            )
 
         # Hits and misses were updated in the loop because LFRU needs those
         # counters immediately; only advance/log the prepare-call interval.

@@ -21,6 +21,8 @@ keeps active experts resident and asynchronously stages cache misses.
   the model.
 - Pinned-RAM expert backing, a bounded GPU LFRU expert cache, asynchronous H2D
   miss staging, and inter-layer route lookahead.
+- An optional lower-RAM cache that combines exclusive CPU/GPU weight ownership
+  with a lossless packed scale mirror.
 - DeepSeek V4 DSpark MTP speculative decoding with five speculative tokens.
 - Piecewise CUDA graph support around the dynamic expert-cache path.
 - Experimental adaptive KV-tail lending and host-staged TP all-reduce paths.
@@ -48,26 +50,20 @@ sudo apt-get install -y build-essential python3-dev git curl
 ```
 
 Install [`uv`](https://docs.astral.sh/uv/), verify that `nvidia-smi` sees the
-GPUs, and then:
+GPUs, and then run the project installer:
 
 ```bash
 git clone https://github.com/chris-orchestris/vLLM_MoE_Experimental.git
 cd vLLM_MoE_Experimental
 
-uv venv --python 3.12 .venv
+bash tools/install_moe_experimental.sh
 source .venv/bin/activate
-
-VLLM_USE_PRECOMPILED=1 \
-VLLM_PRECOMPILED_WHEEL_COMMIT=nightly \
-VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
-uv pip install --editable . --torch-backend=auto
 ```
 
-The precompiled nightly supplies vLLM's compiled base extensions; this checkout
-overlays the experimental Python and Triton code. Run the install with the GPUs
-visible so `--torch-backend=auto` selects CUDA rather than CPU PyTorch. The
-optional native host-all-reduce helpers under `csrc/host_all_reduce/` are not
-required by these quick-start profiles.
+The installer overlays this checkout on the precompiled CUDA 13 nightly and
+builds the small native expert-cache helper automatically. The optional native
+host-all-reduce helpers under `csrc/host_all_reduce/` are not required by these
+quick-start profiles.
 
 ## Common launch settings
 
@@ -163,28 +159,20 @@ vllm serve "$MODEL" \
 
 ### Optional lower-RAM mode
 
-The default cache keeps CPU copies of GPU-resident experts for best speed. The
-exclusive cache removes those copies: on the tested TP4/cache-48 host, vLLM
-worker RAM fell from about 156.5 to 130.6 GiB. Prefill was unchanged;
-single-request generation fell from about 26 to 18-19 tokens/s, while aggregate
-three-request generation was about 8% lower.
+The default cache keeps full CPU copies of GPU-resident experts for the fastest
+single-request decode. The exclusive cache instead combines exclusive CPU/GPU
+FP4 weight ownership with a lossless packed scale mirror. On the tested
+TP4/cache-48 host, worker RAM fell from about 156.5 to 126.3 GiB. Warm 4K
+prefill measured about 1,302 tokens/s, single-request generation 19.4 tokens/s,
+and three-request aggregate throughput 572 tokens/s.
 
-Build the CUDA 13 swap helper once:
+There is no separate raw-exclusive variant: `--moe-expert-cache-exclusive`
+always enables both RAM-saving techniques.
 
-```bash
-mkdir -p build
-CUDA_PKG="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cu13"
-g++ -O3 -std=c++17 -shared -fPIC csrc/cache/cuda_batch_copy_shim.cpp \
-  -I"$CUDA_PKG/include" -L"$CUDA_PKG/lib" \
-  -Wl,-rpath,"$CUDA_PKG/lib" -Wl,-z,defs -Wl,-l:libcudart.so.13 \
-  -o build/cuda_exclusive_swap_shim.so
-```
-
-Then add these settings and flags to either launch recipe:
+The installer already built the required native helper. Add only these flags to
+either launch recipe:
 
 ```bash
-export VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_SWAP_LIBRARY="$PWD/build/cuda_exclusive_swap_shim.so"
-export VLLM_MOE_EXPERT_CACHE_EXCLUSIVE_REGISTERED_BACKING=1
 mkdir -p /fast/local/nvme/vllm-exclusive-staging
 
 # Add to `vllm serve`:

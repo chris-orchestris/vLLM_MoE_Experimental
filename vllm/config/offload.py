@@ -110,12 +110,11 @@ class OffloadConfig:
       path at rounding level."""
 
     moe_expert_cache_exclusive: bool = False
-    """Store each expert in exactly one primary location: either the CPU
-    backing store or the GPU expert cache. On eviction, the outgoing GPU expert
-    is written back while the incoming CPU expert is uploaded on independent
-    copy engines. This reduces host RAM by approximately the GPU cache's share
-    of the expert weights at the cost of bidirectional PCIe traffic on misses.
-    Experimental and disabled by default."""
+    """Enable the combined lower-RAM expert cache. FP4 weights have exactly one
+    primary owner, either CPU or GPU, while E8M0 scales retain a losslessly
+    packed host mirror. Misses exchange weight rows over independent copy
+    engines and expand incoming scales on the GPU. Experimental and disabled
+    by default."""
 
     moe_expert_cache_staging_dir: str | None = None
     """Disk-backed directory used for reclaimable load-time expert staging.

@@ -146,10 +146,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "token" (default) reproduces the uncached output exactly;
             "expert" is much cheaper at small cache sizes but differs at
             rounding level.
-        moe_expert_cache_exclusive: Store each expert either in CPU RAM or the
-            primary GPU cache instead of mirroring GPU-resident experts in
-            both places. Saves host RAM but adds overlapped D2H writeback on
-            primary-cache misses. Experimental and disabled by default.
+        moe_expert_cache_exclusive: Enable the combined lower-RAM cache:
+            exclusive CPU/GPU FP4 weight ownership plus a lossless packed scale
+            mirror. Saves host RAM but adds overlapped D2H writeback on primary
+            cache misses. Experimental and disabled by default.
         moe_expert_cache_staging_dir: Disk-backed directory for reclaimable
             load-time expert tensors. Required with the exclusive cache.
         enforce_eager: Whether to enforce eager execution. If True, we will

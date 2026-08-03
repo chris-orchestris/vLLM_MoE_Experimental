@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+    _PACKED_SCALE_SCRATCH,
     CachedWeightProvider,
     ExpertWeightResult,
     file_backed_host_empty,
@@ -30,7 +31,17 @@ def _make_weights(num_experts: int, dtype: torch.dtype):
     return w13.to(dtype), w2.to(dtype)
 
 
-def _make_scales(num_experts: int):
+def _make_scales(num_experts: int, *, packed: bool = False):
+    if packed:
+        w13_base = torch.randint(118, 120, (num_experts, 1), dtype=torch.uint8)
+        w2_base = torch.randint(119, 121, (num_experts, 1), dtype=torch.uint8)
+        w13_s = (
+            w13_base + torch.randint(0, 8, (num_experts, 7), dtype=torch.uint8)
+        ).view(torch.float8_e8m0fnu)
+        w2_s = (
+            w2_base + torch.randint(0, 8, (num_experts, 5), dtype=torch.uint8)
+        ).view(torch.float8_e8m0fnu)
+        return w13_s, w2_s
     w13_s = torch.rand(num_experts, 1, dtype=torch.float32)
     w2_s = torch.rand(num_experts, 1, dtype=torch.float32)
     return w13_s, w2_s
@@ -59,7 +70,7 @@ def _make_provider(
     )
     scales = None
     if with_scales:
-        w13_s, w2_s = _make_scales(num_experts)
+        w13_s, w2_s = _make_scales(num_experts, packed=exclusive)
         kwargs.update(w13_scale=w13_s, w2_scale=w2_s)
         scales = (w13_s, w2_s)
     return CachedWeightProvider(**kwargs), w13, w2, scales
@@ -133,7 +144,10 @@ def test_exclusive_cache_initial_partition_is_compact():
     _assert_exclusive_ownership(provider)
 
 
-def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales():
+def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_MOE_EXPERT_CACHE_PACKED_SCALES", raising=False)
     provider, w13, w2, scales = _make_provider(
         num_experts=8,
         capacity=4,
@@ -142,6 +156,11 @@ def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales():
     )
     assert scales is not None
     w13_scale, w2_scale = scales
+    assert provider._packed_scales
+    assert provider._packed_scale_backing is not None
+    assert provider._cpu_w13_scale is None
+    assert provider._cpu_w2_scale is None
+    assert len(provider._exclusive_copy_sizes) == 2
 
     result = provider.prepare(_topk([4, 5]), [4, 5])
     torch.accelerator.synchronize()
@@ -151,8 +170,14 @@ def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales():
         torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
         assert result.w1_scale is not None
         assert result.w2_scale is not None
-        torch.testing.assert_close(result.w1_scale[slot].cpu(), w13_scale[expert_id])
-        torch.testing.assert_close(result.w2_scale[slot].cpu(), w2_scale[expert_id])
+        torch.testing.assert_close(
+            result.w1_scale[slot].view(torch.uint8).cpu(),
+            w13_scale[expert_id].view(torch.uint8),
+        )
+        torch.testing.assert_close(
+            result.w2_scale[slot].view(torch.uint8).cpu(),
+            w2_scale[expert_id].view(torch.uint8),
+        )
 
     # Experts 0 and 1 were the deterministic cold-cache LFRU victims and now
     # exist only in the compact host backing.
@@ -176,6 +201,46 @@ def test_exclusive_cache_bidirectional_swap_preserves_weights_and_scales():
         torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
         torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
     _assert_exclusive_ownership(provider)
+
+
+def test_exclusive_packed_scale_staging_is_bounded_across_streams():
+    """Independent layer streams reuse one bounded device transfer ring."""
+    _PACKED_SCALE_SCRATCH.clear()
+    provider, _, _, scales = _make_provider(
+        num_experts=8,
+        capacity=4,
+        with_scales=True,
+        exclusive=True,
+    )
+    assert scales is not None
+    w13_scale, w2_scale = scales
+    assert provider.buf_w13_scale is not None
+    assert provider.buf_w2_scale is not None
+
+    streams = [torch.cuda.Stream() for _ in range(8)]
+    results: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+    for expert_id, stream in enumerate(streams):
+        destination_w13 = torch.empty_like(provider.buf_w13_scale)
+        destination_w2 = torch.empty_like(provider.buf_w2_scale)
+        with torch.cuda.stream(stream):
+            provider._copy_packed_scales(
+                destination_w13,
+                destination_w2,
+                [(0, expert_id)],
+            )
+        results.append((destination_w13, destination_w2, expert_id))
+
+    torch.accelerator.synchronize()
+    assert len(_PACKED_SCALE_SCRATCH) == 1
+    for destination_w13, destination_w2, expert_id in results:
+        torch.testing.assert_close(
+            destination_w13[0].view(torch.uint8).cpu(),
+            w13_scale[expert_id].view(torch.uint8),
+        )
+        torch.testing.assert_close(
+            destination_w2[0].view(torch.uint8).cpu(),
+            w2_scale[expert_id].view(torch.uint8),
+        )
 
 
 def test_exclusive_cache_submits_one_native_wave_per_prepare():
