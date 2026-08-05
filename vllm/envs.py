@@ -272,7 +272,12 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_MOE_PREFER_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_DSPARK_CONFIDENCE_THRESHOLD: float = 0.0
+    VLLM_DSPARK_CONFIDENCE_MIN_BATCH_SIZE: int = 1
+    VLLM_DSPARK_CONFIDENCE_DRAFT_BUDGETS: str = ""
+    VLLM_DSPARK_CONFIDENCE_BATCH_THRESHOLDS: str = ""
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -1910,12 +1915,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
     ),
+    # Prefer the auxiliary stream over modular-kernel internal overlap when
+    # both schedules are available.
+    "VLLM_MOE_PREFER_SHARED_EXPERTS_STREAM": lambda: bool(
+        int(os.getenv("VLLM_MOE_PREFER_SHARED_EXPERTS_STREAM", "0"))
+    ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Truncate DSpark verification at the first draft whose conditional
+    # acceptance confidence is below this threshold. Disabled by default.
+    "VLLM_DSPARK_CONFIDENCE_THRESHOLD": lambda: float(
+        os.getenv("VLLM_DSPARK_CONFIDENCE_THRESHOLD", "0")
+    ),
+    "VLLM_DSPARK_CONFIDENCE_MIN_BATCH_SIZE": lambda: int(
+        os.getenv("VLLM_DSPARK_CONFIDENCE_MIN_BATCH_SIZE", "1")
+    ),
+    "VLLM_DSPARK_CONFIDENCE_DRAFT_BUDGETS": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_DRAFT_BUDGETS", ""
+    ),
+    "VLLM_DSPARK_CONFIDENCE_BATCH_THRESHOLDS": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_BATCH_THRESHOLDS", ""
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer

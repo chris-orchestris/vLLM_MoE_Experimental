@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 
 from tests.v1.core.utils import create_requests
@@ -14,6 +16,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.models.deepseek_v4.ampere.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -21,6 +24,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.input_batch import get_speculative_draft_valid_mask
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+    confidence_budgeted_prefix_lengths,
+    confidence_prefix_lengths,
+    parse_confidence_batch_thresholds,
+    parse_confidence_draft_budgets,
+)
+from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 # Matches defaults from tests/v1/spec_decode/test_eagle.py
@@ -152,3 +163,109 @@ def test_dflash_drafter_window_reserves_bonus_token():
         speculative_config=SimpleNamespace(use_dflash=lambda: False),
     )
     assert input_fits_in_drafter(plain_runner, SimpleNamespace(max_seq_len=97))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_uses_first_failure_as_causal_prefix():
+    confidence = torch.tensor(
+        [
+            [0.9, 0.8, 0.4, 0.95, 0.99],
+            [0.7, 0.6, 0.5, 0.4, 0.3],
+            [0.1, 0.9, 0.9, 0.9, 0.9],
+        ]
+    )
+
+    lengths = confidence_prefix_lengths(confidence, 0.5)
+
+    assert lengths.tolist() == [2, 3, 0]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_preserves_k_below_minimum_batch_size():
+    confidence = torch.tensor([[0.1, 0.1, 0.1, 0.1, 0.1]])
+
+    lengths = confidence_prefix_lengths(confidence, threshold=0.5, min_batch_size=2)
+
+    assert lengths.tolist() == [5]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_budget_selects_best_causal_prefixes():
+    confidence = torch.tensor(
+        [
+            [0.9, 0.9, 0.9, 0.9, 0.9],
+            [0.8, 0.8, 0.8, 0.8, 0.8],
+            [0.7, 0.7, 0.7, 0.7, 0.7],
+        ]
+    )
+    lengths = torch.full((3,), 5, dtype=torch.int32)
+
+    budgeted = confidence_budgeted_prefix_lengths(confidence, lengths, 13)
+
+    assert budgeted.tolist() == [5, 5, 3]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_draft_budget_parser():
+    assert parse_confidence_draft_budgets("2:9,3:13", 4, 5) == {2: 9, 3: 13}
+    with pytest.raises(ValueError, match="batch 3 must be in"):
+        parse_confidence_draft_budgets("3:16", 4, 5)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_batch_threshold_parser():
+    assert parse_confidence_batch_thresholds("2:0.5,3:0", 4) == {
+        2: 0.5,
+        3: 0.0,
+    }
+    with pytest.raises(ValueError, match="batch 3 must be in"):
+        parse_confidence_batch_thresholds("3:1.1", 4)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_dspark_confidence_checkpoint_name_maps_to_loaded_head():
+    model = object.__new__(DSparkDeepseekV4ForCausalLM)
+    model.num_dspark_layers = 3
+
+    mapped = model._remap_dspark_name("mtp.2.confidence_head.proj.weight")
+
+    assert mapped == "model.confidence_head.proj.weight"
+    assert model._remap_dspark_name("mtp.1.confidence_head.proj.weight") is None
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_draft_token_handler_returns_variable_placeholder_lengths():
+    handler = object.__new__(DraftTokensHandler)
+    handler.req_ids = ["first", "second", "third"]
+    handler.num_draft_tokens = 5
+    handler.draft_tokens_np = None
+    handler.draft_lengths_np = np.array([5, 2, 0], dtype=np.int32)
+    handler.copy_event = SimpleNamespace(synchronize=lambda: None)
+
+    output = handler.get_draft_tokens()
+
+    assert output.req_ids == handler.req_ids
+    assert output.draft_token_ids == [[-1] * 5, [-1] * 2, []]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_async_draft_lengths_follow_reordered_request_state_indices():
+    draft_lengths = torch.tensor([2, 5, 0], dtype=torch.int32)
+    expanded_idx_mapping = torch.tensor(
+        [2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+    )
+    expanded_local_pos = torch.arange(6).repeat(3)
+
+    valid = get_speculative_draft_valid_mask(
+        draft_lengths, expanded_idx_mapping, expanded_local_pos
+    )
+
+    assert valid.view(3, 6).sum(dim=1).tolist() == [1, 3, 6]

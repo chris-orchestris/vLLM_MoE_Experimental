@@ -33,6 +33,15 @@ class InputBuffers:
         )
 
 
+def get_speculative_draft_valid_mask(
+    draft_lengths: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+) -> torch.Tensor:
+    """Return valid target-logit rows for worker-local draft prefixes."""
+    return expanded_local_pos <= draft_lengths[expanded_idx_mapping]
+
+
 @dataclass
 class InputBatch:
     # batch_idx -> req_id
@@ -98,6 +107,9 @@ class InputBatch:
 
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
+
+    # [num_reqs] worker-local usable draft prefix lengths for async scheduling.
+    valid_draft_lengths: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(
@@ -166,6 +178,7 @@ class InputBatch:
             num_tokens_after_padding=num_tokens,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
+            valid_draft_lengths=None,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,

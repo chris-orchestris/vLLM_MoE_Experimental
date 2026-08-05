@@ -76,6 +76,12 @@ class RequestState:
             dtype=torch.int64,
             device=device,
         )
+        self.draft_lengths = torch.full(
+            (self.max_num_reqs,),
+            self.num_speculative_steps,
+            dtype=torch.int32,
+            device=device,
+        )
 
         self.next_prefill_tokens = torch.zeros(
             num_prefill_lookahead,
@@ -115,6 +121,7 @@ class RequestState:
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
 
         self.draft_tokens[req_idx].zero_()
+        self.draft_lengths[req_idx] = self.num_speculative_steps
 
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()

@@ -19,6 +19,8 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
 
+_PREFERRED_AUX_STREAM_MAX_TOKENS = 8
+
 logger = init_logger(__name__)
 
 
@@ -93,9 +95,6 @@ class SharedExperts(torch.nn.Module):
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
 
-        if self._mk_can_overlap_shared_experts():
-            return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
-
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
@@ -103,10 +102,20 @@ class SharedExperts(torch.nn.Module):
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         )
 
+        if (
+            envs.VLLM_MOE_PREFER_SHARED_EXPERTS_STREAM
+            and should_run_shared_in_aux_stream
+            and hidden_states.shape[0] <= _PREFERRED_AUX_STREAM_MAX_TOKENS
+        ):
+            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+
+        if self._mk_can_overlap_shared_experts():
+            return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+
         if should_run_shared_in_aux_stream:
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-        else:
-            return SharedExpertsOrder.NO_OVERLAP
+
+        return SharedExpertsOrder.NO_OVERLAP
 
     def maybe_sync_shared_experts_stream(
         self,

@@ -321,17 +321,24 @@ def _compute_cumulative_log_p_kernel(
     cu_num_logits_ptr,
     # [num_reqs]
     idx_mapping_ptr,
+    # [num_reqs]
+    valid_draft_lengths_ptr,
     # [max_num_reqs]
     temp_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    HAS_VALID_DRAFT_LENGTHS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
+    if HAS_VALID_DRAFT_LENGTHS:
+        num_draft_tokens = tl.minimum(
+            num_draft_tokens, tl.load(valid_draft_lengths_ptr + req_idx)
+        )
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     if temp == 0.0:
         return
@@ -495,6 +502,8 @@ def _rejection_kernel(
     cu_num_logits_ptr,
     # [num_reqs]
     idx_mapping_ptr,
+    # [num_reqs]
+    valid_draft_lengths_ptr,
     # [max_num_reqs]
     temp_ptr,
     # [max_num_reqs]
@@ -513,12 +522,17 @@ def _rejection_kernel(
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
+    HAS_VALID_DRAFT_LENGTHS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
+    if HAS_VALID_DRAFT_LENGTHS:
+        num_draft_tokens = tl.minimum(
+            num_draft_tokens, tl.load(valid_draft_lengths_ptr + req_idx)
+        )
     seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_greedy = temp == 0.0
@@ -676,6 +690,8 @@ def _resample_kernel(
     rejected_step_ptr,
     # [num_reqs + 1]
     cu_num_logits_ptr,
+    # [num_reqs]
+    valid_draft_lengths_ptr,
     # [num_logits]
     expanded_idx_mapping_ptr,
     # [num_logits]
@@ -693,11 +709,14 @@ def _resample_kernel(
     HAS_DRAFT_LOGITS: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
+    HAS_VALID_DRAFT_LENGTHS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     resample_idx = tl.load(rejected_step_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if HAS_VALID_DRAFT_LENGTHS:
+        end_idx = start_idx + tl.load(valid_draft_lengths_ptr + req_idx) + 1
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
 
@@ -819,15 +838,20 @@ def _insert_resampled_kernel(
     # [num_reqs + 1]
     cu_num_logits_ptr,
     # [num_reqs]
+    valid_draft_lengths_ptr,
+    # [num_reqs]
     expanded_idx_mapping_ptr,
     # [max_num_reqs]
     temp_ptr,
     PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
+    HAS_VALID_DRAFT_LENGTHS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if HAS_VALID_DRAFT_LENGTHS:
+        end_idx = start_idx + tl.load(valid_draft_lengths_ptr + req_idx) + 1
     resample_token_idx = start_idx + num_sampled
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
 
@@ -885,6 +909,7 @@ def rejection_sample(
     num_speculative_steps: int,
     # [num_speculative_steps]
     synthetic_conditional_rates: torch.Tensor | None = None,
+    valid_draft_lengths: torch.Tensor | None = None,
     use_fp64: bool = False,
     use_block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -893,6 +918,8 @@ def rejection_sample(
         draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
     )
     num_reqs = cu_num_logits.shape[0] - 1
+    if valid_draft_lengths is not None:
+        assert valid_draft_lengths.shape == (num_reqs,)
     num_logits, vocab_size = target_logits.shape
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
@@ -978,10 +1005,12 @@ def rejection_sample(
             draft_local_sumexp.stride(0),
             cu_num_logits,
             idx_mapping,
+            valid_draft_lengths,
             temperature,
             vocab_num_blocks,
             PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
             HAS_DRAFT_LOGITS=has_draft_logits,
+            HAS_VALID_DRAFT_LENGTHS=valid_draft_lengths is not None,
             num_warps=1,
         )
 
@@ -1057,6 +1086,7 @@ def rejection_sample(
         draft_local_sumexp.stride(0),
         cu_num_logits,
         idx_mapping,
+        valid_draft_lengths,
         temperature,
         seed,
         pos,
@@ -1069,6 +1099,7 @@ def rejection_sample(
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        HAS_VALID_DRAFT_LENGTHS=valid_draft_lengths is not None,
         num_warps=1,
     )
 
@@ -1098,6 +1129,7 @@ def rejection_sample(
         draft_rejected_logsumexp,
         num_sampled,
         cu_num_logits,
+        valid_draft_lengths,
         expanded_idx_mapping,
         draft_sampled,
         temperature,
@@ -1109,6 +1141,7 @@ def rejection_sample(
         HAS_DRAFT_LOGITS=has_draft_logits,
         USE_FP64=use_fp64,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        HAS_VALID_DRAFT_LENGTHS=valid_draft_lengths is not None,
     )
 
     # Insert the resampled tokens into the output sampled.
@@ -1122,8 +1155,10 @@ def rejection_sample(
         resampled_local_max.stride(0),
         resample_num_blocks,
         cu_num_logits,
+        valid_draft_lengths,
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        HAS_VALID_DRAFT_LENGTHS=valid_draft_lengths is not None,
     )
     return sampled, num_sampled

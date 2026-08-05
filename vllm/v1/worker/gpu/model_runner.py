@@ -93,6 +93,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    get_speculative_draft_valid_mask,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -228,6 +229,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
+        self.use_async_draft_lengths = bool(
+            self.scheduler_config.async_scheduling
+            and self.speculator is not None
+            and getattr(self.speculator, "draft_lengths", None) is not None
+        )
+        if self.use_async_draft_lengths and not envs.VLLM_MOE_SKIP_PADDING:
+            logger.warning_once(
+                "Async DSpark confidence lengths are enabled while MoE padding "
+                "skips are disabled; speculative correctness is preserved, but "
+                "pruned routed-expert work will still execute."
+            )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -1074,6 +1086,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.num_new_sampled_tokens_per_step,
         )
 
+        valid_draft_lengths = None
+        if self.use_async_draft_lengths and total_num_draft_tokens > 0:
+            assert num_bonus_tokens == 1
+            scheduled_draft_lengths = (
+                cu_num_logits[1:] - cu_num_logits[:-1] - num_bonus_tokens
+            )
+            valid_draft_lengths = torch.minimum(
+                self.req_states.draft_lengths[idx_mapping], scheduled_draft_lengths
+            )
+            valid_logits = get_speculative_draft_valid_mask(
+                self.req_states.draft_lengths,
+                expanded_idx_mapping,
+                expanded_local_pos,
+            )
+            if envs.VLLM_MOE_SKIP_PADDING:
+                self.input_buffers.is_padding.index_copy_(
+                    0, logits_indices, ~valid_logits
+                )
+
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
@@ -1107,6 +1138,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
             num_draft_tokens_per_req=num_draft_tokens_per_req,
+            valid_draft_lengths=valid_draft_lengths,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
@@ -1606,6 +1638,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            draft_lengths = getattr(self.speculator, "draft_lengths", None)
+            if draft_lengths is not None:
+                self.req_states.draft_lengths[input_batch.idx_mapping] = draft_lengths[
+                    : input_batch.num_reqs
+                ]
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -1613,6 +1650,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                None
+                if self.use_async_draft_lengths
+                else getattr(self.speculator, "draft_lengths", None),
             )
 
         # Post-step KV connector related operations.

@@ -235,6 +235,35 @@ def test_dsv4_fast_topk(
 
 
 @pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="The DeepSeek V4 fast path is CUDA-only.",
+)
+def test_dsv4_fast_topk_padding():
+    torch.manual_seed(0)
+    num_tokens = 8
+    gating_output = torch.randn((num_tokens, 384), device="cuda")
+    correction_bias = torch.randn(384, device="cuda")
+    is_padding = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+    is_padding[1::2] = True
+
+    topk_weights, topk_ids = dsv4_topk(
+        gating_output,
+        correction_bias,
+        torch.int32,
+        1.5,
+        is_padding,
+    )
+    ref_weights, ref_ids = dsv4_topk(gating_output, correction_bias, torch.int32, 1.5)
+
+    assert torch.equal(topk_ids[is_padding], torch.full_like(topk_ids[is_padding], -1))
+    assert torch.equal(
+        topk_weights[is_padding], torch.zeros_like(topk_weights[is_padding])
+    )
+    torch.testing.assert_close(topk_ids[~is_padding], ref_ids[~is_padding])
+    torch.testing.assert_close(topk_weights[~is_padding], ref_weights[~is_padding])
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="This test is skipped on non-CUDA platform.",
 )

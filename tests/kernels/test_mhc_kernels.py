@@ -9,6 +9,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _torch_hc_prenorm_gemm,
 )
 from vllm.model_executor.kernels.mhc.triton import (
+    mhc_fused_post_pre_triton,
     mhc_post_triton,
     mhc_pre_triton,
     mhc_sinkhorn_triton,
@@ -136,6 +137,77 @@ def test_mhc_pre_triton(num_tokens):
         1.0,
         20,
     )
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor,
+            expected_tensor,
+            atol=5e-2,
+            rtol=1e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("num_tokens", [24, 1024])
+def test_mhc_pre_triton_cudagraph_replay(num_tokens: int):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    hidden_size = 4096
+    hc_mult = 4
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 1.0, 20)
+
+    for _ in range(2):
+        mhc_pre_triton(residual, *args)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mhc_pre_triton(residual, *args)
+
+    residual.copy_(torch.randn_like(residual))
+    graph.replay()
+    expected = mhc_pre_ref(residual, *args)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor,
+            expected_tensor,
+            atol=5e-2,
+            rtol=1e-2,
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+def test_mhc_fused_post_pre_triton():
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    num_tokens = 512
+    hidden_size = 4096
+    hc_mult = 4
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    pre_args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 1.0, 20)
+
+    expected_residual = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    expected = (expected_residual, *mhc_pre_ref(expected_residual, *pre_args))
+    actual = mhc_fused_post_pre_triton(
+        x, residual, post_layer_mix, comb_res_mix, *pre_args
+    )
+
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
             actual_tensor,
