@@ -460,7 +460,7 @@ def init_kv_cache(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], torch.Tensor | None]:
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     kv_cache_raw_tensors, packed_backing = _allocate_kv_cache(
         kv_cache_config, shared_kv_cache_layers, device

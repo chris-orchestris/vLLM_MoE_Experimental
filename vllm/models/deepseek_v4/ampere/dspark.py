@@ -51,6 +51,26 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+class DSparkConfidenceHead(nn.Module):
+    def __init__(self, input_size: int, prefix: str) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(
+            input_size,
+            1,
+            bias=False,
+            params_dtype=torch.float32,
+            quant_config=None,
+            prefix=maybe_prefix(prefix, "proj"),
+            return_bias=False,
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, markov_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        features = torch.cat((hidden_states, markov_embeds), dim=-1).float()
+        return torch.sigmoid(self.proj(features).squeeze(-1))
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -116,6 +136,10 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+        )
+        self.confidence_head = DSparkConfidenceHead(
+            config.hidden_size + config.dspark_markov_rank,
+            prefix=maybe_prefix(prefix, "confidence_head"),
         )
         self.mhc_post_op = MHCPostOp()
         self.hc_head_op = HCHeadOp()
@@ -184,9 +208,7 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = self.mhc_post_op(
-            hidden_states, residual, post_mix, res_mix
-        )
+        hidden_states = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
         # hc_head reduces the hc copies; return the PRE-norm head hidden
         hidden_states = self.hc_head_op(
             hidden_states,
@@ -257,6 +279,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.num_dspark_layers = self.model.num_dspark_layers
+        self.confidence_head_loaded = False
         # Shared with the target (aliased by the speculator's load utility).
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
@@ -313,6 +337,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def compute_confidence(
+        self, hidden_states: torch.Tensor, markov_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.confidence_head(hidden_states, markov_embeds)
 
     # --- Weight loading ----------------------------------------------------
 
@@ -433,6 +462,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         self._finalize_moe()
+        self.confidence_head_loaded = (
+            "model.confidence_head.proj.weight" in loaded_params
+        )
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -450,9 +482,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
         if rest.startswith("confidence_head."):
-            return None
+            if stage != self.num_dspark_layers - 1:
+                return None
+            return f"model.{rest}"
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
         head_prefixes = (

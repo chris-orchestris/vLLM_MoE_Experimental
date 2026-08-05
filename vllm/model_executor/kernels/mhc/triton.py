@@ -153,6 +153,139 @@ def mhc_post_triton(
     return out.view(*outer_shape, hc, hidden_size)
 
 
+@triton.jit
+def _mhc_mixes_sumsq_kernel(
+    residual_ptr,
+    fn_ptr,
+    mixes_ptr,
+    sumsq_ptr,
+    n_tokens,
+    k_size: tl.constexpr,
+    n_mix: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mix_offsets = tl.arange(0, BLOCK_N)
+    token_mask = token_offsets < n_tokens
+
+    accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    square_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k_start in tl.range(0, k_size, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        residual = tl.load(
+            residual_ptr + token_offsets[:, None] * k_size + k_offsets[None, :],
+            mask=token_mask[:, None] & (k_offsets[None, :] < k_size),
+            other=0.0,
+        ).to(tl.float32)
+        fn = tl.load(
+            fn_ptr + k_offsets[:, None] + mix_offsets[None, :] * k_size,
+            mask=(k_offsets[:, None] < k_size) & (mix_offsets[None, :] < n_mix),
+            other=0.0,
+        ).to(tl.float32)
+        # The measured large-prefill path intentionally uses TF32 tensor cores
+        # with FP32 accumulation; equivalence is tolerance-based, not bitwise.
+        accum += tl.dot(residual, fn, input_precision="tf32")
+        square_sum += tl.sum(residual * residual, axis=1)
+
+    tl.store(
+        mixes_ptr + token_offsets[:, None] * n_mix + mix_offsets[None, :],
+        accum,
+        mask=token_mask[:, None] & (mix_offsets[None, :] < n_mix),
+    )
+    tl.store(sumsq_ptr + token_offsets, square_sum, mask=token_mask)
+
+
+@triton.jit
+def _mhc_post_comb_kernel(
+    mixes_ptr,
+    sumsq_ptr,
+    scale_ptr,
+    base_ptr,
+    post_ptr,
+    comb_ptr,
+    n_tokens,
+    rms_eps: tl.constexpr,
+    sinkhorn_eps: tl.constexpr,
+    post_mult: tl.constexpr,
+    k_size: tl.constexpr,
+    n_mix: tl.constexpr,
+    hc_mult: tl.constexpr,
+    sinkhorn_repeat: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    if token_idx >= n_tokens:
+        return
+
+    norm = tl.rsqrt(tl.load(sumsq_ptr + token_idx) / k_size + rms_eps)
+    hc_offsets = tl.arange(0, hc_mult)
+    post_logits = tl.load(
+        mixes_ptr + token_idx * n_mix + hc_mult + hc_offsets
+    ) * norm * tl.load(scale_ptr + 1) + tl.load(base_ptr + hc_mult + hc_offsets)
+    post = tl.sigmoid(post_logits) * post_mult
+    tl.store(post_ptr + token_idx * hc_mult + hc_offsets, post)
+
+    rows = tl.arange(0, hc_mult)
+    cols = tl.arange(0, hc_mult)
+    comb_offsets = rows[:, None] * hc_mult + cols[None, :]
+    comb = tl.load(
+        mixes_ptr + token_idx * n_mix + 2 * hc_mult + comb_offsets
+    ) * norm * tl.load(scale_ptr + 2) + tl.load(base_ptr + 2 * hc_mult + comb_offsets)
+    row_max = tl.max(comb, axis=1)
+    comb = tl.exp(comb - row_max[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + sinkhorn_eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + sinkhorn_eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + sinkhorn_eps)
+    tl.store(comb_ptr + token_idx * hc_mult * hc_mult + comb_offsets, comb)
+
+
+@triton.jit
+def _mhc_layer_input_from_mixes_kernel(
+    residual_ptr,
+    mixes_ptr,
+    sumsq_ptr,
+    scale_ptr,
+    base_ptr,
+    output_ptr,
+    n_tokens,
+    rms_eps: tl.constexpr,
+    pre_eps: tl.constexpr,
+    k_size: tl.constexpr,
+    n_mix: tl.constexpr,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    hidden_offsets = tl.program_id(1).to(tl.int64) * BLOCK_H + tl.arange(0, BLOCK_H)
+    hidden_mask = hidden_offsets < hidden_size
+    norm = tl.rsqrt(tl.load(sumsq_ptr + token_idx) / k_size + rms_eps)
+    pre_scale = tl.load(scale_ptr)
+    accum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for hc_idx in tl.static_range(0, hc_mult):
+        pre_logit = tl.load(
+            mixes_ptr + token_idx * n_mix + hc_idx
+        ) * norm * pre_scale + tl.load(base_ptr + hc_idx)
+        weight = tl.sigmoid(pre_logit) + pre_eps
+        residual = tl.load(
+            residual_ptr
+            + token_idx * hc_mult * hidden_size
+            + hc_idx * hidden_size
+            + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accum += weight * residual
+    tl.store(
+        output_ptr + token_idx * hidden_size + hidden_offsets,
+        accum,
+        mask=(token_idx < n_tokens) & hidden_mask,
+    )
+
+
 def mhc_pre_triton(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -173,29 +306,97 @@ def mhc_pre_triton(
     residual_flat = residual.view(-1, hc, hidden_size)
     n_tokens = residual_flat.shape[0]
 
-    residual_fp32 = residual_flat.view(n_tokens, hc * hidden_size).float()
-    mixes = torch.matmul(residual_fp32, fn.t())
-    square_sum = residual_fp32.square().sum(dim=-1, keepdim=True)
-    mixes = mixes * torch.rsqrt(square_sum / (hc * hidden_size) + rms_eps)
+    k_size = hc * hidden_size
+    if n_tokens < 512:
+        residual_fp32 = residual_flat.view(n_tokens, k_size).float()
+        mixes = torch.matmul(residual_fp32, fn.t())
+        square_sum = residual_fp32.square().sum(dim=-1, keepdim=True)
+        mixes = mixes * torch.rsqrt(square_sum / k_size + rms_eps)
 
-    pre_logits = mixes[:, :hc] * hc_scale[0] + hc_base[:hc]
-    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
-    post_logits = mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
-    post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
-    comb_logits = mixes[:, 2 * hc :].view(n_tokens, hc, hc) * hc_scale[2] + hc_base[
-        2 * hc :
-    ].view(1, hc, hc)
-    comb_mix = mhc_sinkhorn_triton(
-        comb_logits,
-        hc_sinkhorn_eps,
-        sinkhorn_repeat,
+        pre_logits = mixes[:, :hc] * hc_scale[0] + hc_base[:hc]
+        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+        post_logits = mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
+        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+        comb_logits = mixes[:, 2 * hc :].view(n_tokens, hc, hc) * hc_scale[2] + hc_base[
+            2 * hc :
+        ].view(1, hc, hc)
+        comb_mix = mhc_sinkhorn_triton(
+            comb_logits,
+            hc_sinkhorn_eps,
+            sinkhorn_repeat,
+        )
+        layer_input = torch.einsum(
+            "bi,bih->bh",
+            pre_mix,
+            residual_fp32.view(n_tokens, hc, hidden_size),
+        ).to(torch.bfloat16)
+        return (
+            post_mix.view(*outer_shape, hc, 1),
+            comb_mix.view(*outer_shape, hc, hc),
+            layer_input.view(*outer_shape, hidden_size),
+        )
+
+    n_mix = fn.shape[0]
+    block_n = max(16, triton.next_power_of_2(n_mix))
+    mixes = torch.empty((n_tokens, n_mix), dtype=torch.float32, device=residual.device)
+    square_sum = torch.empty((n_tokens,), dtype=torch.float32, device=residual.device)
+    _mhc_mixes_sumsq_kernel[(triton.cdiv(n_tokens, 32),)](
+        residual_flat,
+        fn,
+        mixes,
+        square_sum,
+        n_tokens,
+        k_size=k_size,
+        n_mix=n_mix,
+        BLOCK_M=32,
+        BLOCK_N=block_n,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
     )
 
-    layer_input = torch.einsum(
-        "bi,bih->bh",
-        pre_mix,
-        residual_fp32.view(n_tokens, hc, hidden_size),
-    ).to(torch.bfloat16)
+    post_mix = torch.empty((n_tokens, hc), dtype=torch.float32, device=residual.device)
+    comb_mix = torch.empty(
+        (n_tokens, hc, hc), dtype=torch.float32, device=residual.device
+    )
+    _mhc_post_comb_kernel[(n_tokens,)](
+        mixes,
+        square_sum,
+        hc_scale,
+        hc_base,
+        post_mix,
+        comb_mix,
+        n_tokens,
+        rms_eps=rms_eps,
+        sinkhorn_eps=hc_sinkhorn_eps,
+        post_mult=hc_post_mult_value,
+        k_size=k_size,
+        n_mix=n_mix,
+        hc_mult=hc,
+        sinkhorn_repeat=sinkhorn_repeat,
+        num_warps=1,
+    )
+    layer_input = torch.empty(
+        (n_tokens, hidden_size), dtype=torch.bfloat16, device=residual.device
+    )
+    block_h = 256
+    _mhc_layer_input_from_mixes_kernel[(n_tokens, triton.cdiv(hidden_size, block_h))](
+        residual_flat,
+        mixes,
+        square_sum,
+        hc_scale,
+        hc_base,
+        layer_input,
+        n_tokens,
+        rms_eps=rms_eps,
+        pre_eps=hc_pre_eps,
+        k_size=k_size,
+        n_mix=n_mix,
+        hidden_size=hidden_size,
+        hc_mult=hc,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
     return (
         post_mix.view(*outer_shape, hc, 1),
         comb_mix.view(*outer_shape, hc, hc),

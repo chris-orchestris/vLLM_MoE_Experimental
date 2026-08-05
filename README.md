@@ -102,7 +102,6 @@ assumes 56 or more physical CPU cores; the 14 all-reduce threads per rank use
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-export VLLM_MARLIN_USE_ATOMIC_ADD=1
 export VLLM_MOE_ASYNC_EXPERT_MAP=0
 
 export NCCL_ALGO=Ring
@@ -135,6 +134,15 @@ export DSV4_MOE_KV_TAIL_LOG_ALLOCATIONS=1
 export VLLM_MOE_KV_TAIL_DECODE_VICTIM=1
 export VLLM_MOE_KV_TAIL_DECODE_VICTIM_MAX_TOKENS=24
 
+export VLLM_MOE_PREFER_SHARED_EXPERTS_STREAM=1
+export VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=8
+export VLLM_MOE_SKIP_PADDING=1
+
+export VLLM_DSPARK_CONFIDENCE_THRESHOLD=0.5
+export VLLM_DSPARK_CONFIDENCE_MIN_BATCH_SIZE=2
+export VLLM_DSPARK_CONFIDENCE_BATCH_THRESHOLDS=3:0.6,4:0.6
+export VLLM_DSPARK_CONFIDENCE_DRAFT_BUDGETS=3:13
+
 vllm serve "$MODEL" \
   --served-model-name DeepSeek-V4-Flash-0731 \
   --host 127.0.0.1 \
@@ -161,16 +169,25 @@ vllm serve "$MODEL" \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
   --disable-custom-all-reduce \
-  --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":24}' \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,6,12,18,24]}' \
+  --async-scheduling \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
-Measured steady-state resource use was 23,471-23,492 MiB (about 22.9 GiB) VRAM
-per GPU, about 169 GiB of system RAM used (roughly 40 GiB RSS per worker), and
-221,269 physical KV tokens before the tail is lent to the expert tiers. Use a
-256 GiB RAM host and allow about 160 GiB of disk for the checkpoint. On the
-five-GPU test host, physical GPUs `0,1,3,4` were selected for their topology;
-on a four-GPU machine, `0,1,2,3` is the normal choice.
+Measured warm use was 23,679-23,710 MiB VRAM per GPU. The 200K stress path has
+only a few hundred MiB of headroom, so the four cards should be dedicated to
+the server. System RAM use was about 169 GiB (roughly 40 GiB RSS per worker),
+and the layout exposes 221,269 physical KV tokens before its tail is lent to
+the expert tiers. Use a 256 GiB RAM host and allow about 160 GiB of disk for
+the checkpoint. On the five-GPU test host, physical GPUs `0,1,3,4` were
+selected for their topology; on a four-GPU machine, `0,1,2,3` is normal.
+
+Confidence pruning is disabled for one request, uses threshold 0.5 for two,
+and 0.6 for three or four. The three-request budget keeps at most 16 active
+routed-expert rows inside the fixed 18-row graph. These settings retain fixed
+DSpark-5 scheduler accounting while masking low-value rows inside the worker.
+The fused large-prefill mHC path uses TF32 tensor-core multiplies with FP32
+accumulation; its equivalence is tolerance-based rather than bitwise.
 
 The fixed KV size and the two fence values form one tested layout. If another
 display load or driver footprint causes OOM, omit `--kv-cache-memory` and unset
@@ -180,28 +197,18 @@ tail. Do not change only the fixed KV byte count while retaining these fences.
 
 ### Optimal 2x RTX 3090 + CPU RAM
 
-This uses the same 56-core CPU budget as TP4: 28 all-reduce threads per rank.
-On the five-GPU test host, physical GPUs `0,3` were the best separate-root pair.
+Use the pair with working NVLink and separate CPU roots. On the five-GPU test
+host this was physical GPUs `1,4`; `0,1` is the normal two-GPU choice. Leave
+NCCL algorithm, protocol, and channel selection automatic. This winner uses
+PyNCCL and does not use host-staged or vLLM custom all-reduce.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-export VLLM_MARLIN_USE_ATOMIC_ADD=1
 export VLLM_MOE_ASYNC_EXPERT_MAP=0
 
-export NCCL_ALGO=Ring
-export NCCL_PROTO=LL,Simple
-export NCCL_MIN_NCHANNELS=1
-export NCCL_MAX_NCHANNELS=1
-
-export VLLM_HOST_ALLREDUCE=1
-export VLLM_HOST_ALLREDUCE_MIN_BYTES=8388608
-export VLLM_HOST_ALLREDUCE_MAX_BYTES=67108864
-export VLLM_HOST_ALLREDUCE_THREADS_PER_RANK=28
-export VLLM_HOST_ALLREDUCE_PIPELINE_CHUNKS=8
-export VLLM_HOST_ALLREDUCE_MAPPED_OUTPUT=1
-export VLLM_HOST_ALLREDUCE_LIBRARY="$PWD/vllm/distributed/device_communicators/host_barrier_pipeline_shim.so"
-export VLLM_HOST_ALLREDUCE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/distributed/device_communicators/mapped_host_tensor_ext.so"
+unset NCCL_ALGO NCCL_PROTO NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS
+export VLLM_HOST_ALLREDUCE=0
 
 export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=20
 export VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE=1
@@ -219,11 +226,11 @@ vllm serve "$MODEL" \
   --max-model-len 200000 \
   --tensor-parallel-size 2 \
   --distributed-executor-backend mp \
-  --gpu-memory-utilization 0.98 \
-  --kv-cache-memory 5100273664 \
+  --gpu-memory-utilization 0.975 \
+  --kv-cache-memory 4650000000 \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --moe-expert-cache-size 20 \
+  --moe-expert-cache-size 21 \
   --moe-expert-cache-split expert \
   --moe-backend marlin \
   --max-num-seqs 2 \
@@ -239,12 +246,12 @@ vllm serve "$MODEL" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
-Measured use was 23,269 MiB VRAM per GPU when idle and 23,951 MiB after the
-195.6K-token test, leaving 625 MiB free. System RAM use was about 165 GiB
-(roughly 78 GiB RSS per worker). The fixed 4.75 GiB KV allocation holds 246,034
-physical tokens. Use 256 GiB of RAM. If another GPU load causes OOM, omit
-`--kv-cache-memory` so vLLM profiles a safe value; keep the cache at 20 unless
-you specifically need more HBM margin.
+The 195,262-token gate peaked at 23,922 MiB per GPU and left 452 MiB free.
+System RAM use is about 171 GiB (77.4 GiB RSS per worker). The fixed 4.65-GB
+KV allocation exposes 224,323 physical tokens. Use 256 GiB of RAM and dedicate
+both GPUs to the server. If another GPU load causes OOM, omit
+`--kv-cache-memory` so vLLM profiles a safe value; reduce the cache to 20 only
+if more HBM margin is required.
 
 ### Optional lower-RAM mode
 
@@ -295,6 +302,42 @@ on this model is roughly another 5 GiB per rank. That second effect, not the
 cache, is why the 2-GPU recipe uses a smaller cache and batch than the 4-GPU
 one. If you change TP or `--moe-expert-cache-size`, budget both.
 
+### 8x RTX 3090 OOM recovery
+
+This path is supported by the cache but has not been hardware-validated here.
+Eight cards provide 192 GiB total, but each rank still has a separate 24-GiB
+budget. For an 8K, single-request server that keeps DSpark-5, use the common
+settings above, TP8, `--gpu-memory-utilization 0.97`, and:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=32
+export VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE=1
+export VLLM_MOE_GPU_RESIDENT_MAX_TOKENS=24
+export VLLM_MOE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/model_executor/layers/fused_moe/mapped_host_tensor_typed_ext.so"
+export VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED=1
+
+# Add to `vllm serve`:
+--max-model-len 8192 \
+--tensor-parallel-size 8 \
+--gpu-memory-utilization 0.97 \
+--kv-cache-dtype fp8 \
+--block-size 256 \
+--moe-expert-cache-size 232 \
+--moe-expert-cache-split expert \
+--max-num-seqs 1 \
+--max-num-batched-tokens 1024 \
+--compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":8}' \
+--speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+```
+
+This keeps 232/256 experts resident, recovers about 1.7 GiB per GPU, and needs
+256 GiB of system RAM for the CPU backing. If it is still tight, use cache 224.
+For all-resident weights, use cache 0, disable the cache-specific exports plus
+the common async/prefetch exports, omit `--speculative-config`, and cap graph
+capture at 1. Removing DSpark recovers about 1.2 GiB per GPU. Do not use
+utilization 1.0 to cover an OOM.
+
 Both examples bind the OpenAI-compatible server to localhost. A single 200K
 request consumes most of the available KV capacity, so the sequence limits are
 useful for ordinary workloads but do not imply several simultaneous 200K
@@ -303,15 +346,15 @@ pinned expert storage, and compile/cache kernels.
 
 ## Reference performance
 
-On the tested 3090 host, the recipe above prefills a cold 77.9K-token prompt at
-832.5 tokens/s and generates a 1,024-token continuation at 35.47 tokens/s.
-Aggregate output throughput was 25.25 tokens/s for two concurrent requests and
-24.22 tokens/s for three. TP2 reached 920.6 prompt tokens/s at 18.9K tokens,
-14.64 generation tokens/s on the short decode, 12.25 tokens/s for a 1,024-token
-continuation after a cached 77.9K prefix, and 13.41 aggregate output tokens/s
-for two concurrent requests. Its 195.6K-token prefill reached 433.7 tokens/s.
-These are development measurements, not guarantees; host memory bandwidth, CPU,
-drivers, and request shape matter.
+On the tested 3090 host, TP4 cold-prefill rates were 1,329 tokens/s at 18.7K,
+867 at 77.9K, and 504 at 195.3K. A cached 77.9K prefix decoded at 34.22
+tokens/s. Matched 8K/512 runs reached 26.15, 28.54, and 29.48 aggregate output
+tokens/s at parallel two, three, and four; post-first-token rates were 31.44,
+32.49, and 32.54 tokens/s. TP2 reached 1,018, 723, and 452 tokens/s on the same
+cold-prefill sizes, 19.07 tokens/s after the cached 77.9K prefix, and 14.99
+aggregate/17.16 post-first tokens/s at parallel two. These are development
+measurements, not guarantees; host memory bandwidth, CPU, drivers, and request
+shape matter.
 
 ---
 

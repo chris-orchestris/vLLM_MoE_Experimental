@@ -215,6 +215,63 @@ def test_greedy_rejection_sample(num_speculative_steps: int):
     )
 
 
+@pytest.mark.parametrize("use_block_verification", [False, True])
+def test_valid_draft_lengths_cap_each_request_prefix(use_block_verification: bool):
+    torch.manual_seed(42)
+    device = "cuda"
+    num_speculative_steps = 3
+    num_reqs = 3
+    logits = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    inputs = _build_rejection_sample_inputs(
+        logits,
+        logits,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=num_reqs,
+    )
+    valid_draft_lengths = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
+
+    _, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        valid_draft_lengths=valid_draft_lengths,
+        use_block_verification=use_block_verification,
+    )
+
+    assert torch.equal(num_sampled, valid_draft_lengths + 1)
+
+
+def test_valid_draft_lengths_emit_greedy_bonus_at_prefix_end():
+    torch.manual_seed(42)
+    device = "cuda"
+    num_speculative_steps = 3
+    num_reqs = 3
+    logits = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    inputs = _build_rejection_sample_inputs(
+        logits,
+        logits,
+        num_speculative_steps,
+        temperature=0.0,
+        num_trials=num_reqs,
+    )
+    target_argmax = logits.argmax()
+    inputs["draft_logits"] = None
+    inputs["draft_sampled"].view(num_reqs, num_speculative_steps + 1)[:, 1:] = (
+        target_argmax
+    )
+    valid_draft_lengths = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
+
+    sampled, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        valid_draft_lengths=valid_draft_lengths,
+    )
+
+    assert torch.equal(num_sampled, valid_draft_lengths + 1)
+    positions = torch.arange(num_speculative_steps + 1, device=device)
+    assert torch.all(sampled[positions < num_sampled.unsqueeze(1)] == target_argmax)
+
+
 @pytest.mark.parametrize(
     "num_speculative_steps,temperature,unconditional_rates",
     [

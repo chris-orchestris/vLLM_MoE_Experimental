@@ -43,9 +43,11 @@ if current_platform.is_cuda():
         correction_bias_ptr,
         topk_weights_ptr,
         topk_ids_ptr,
+        is_padding_ptr,
         routed_scaling_factor,
         NUM_EXPERTS: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_PADDING: tl.constexpr,
         launch_pdl: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -86,6 +88,10 @@ if current_platform.is_cuda():
         selected_weights *= routed_scaling_factor / tl.where(
             weight_sum > 0.0, weight_sum, 1.0
         )
+        if HAS_PADDING:
+            is_padding = tl.load(is_padding_ptr + row)
+            selected_weights = tl.where(is_padding, 0.0, selected_weights)
+            selected_ids = tl.where(is_padding, -1, selected_ids)
         output_mask = topk_offsets < 6
         output_offsets = row * 6 + topk_offsets
 
@@ -101,6 +107,7 @@ def dsv4_topk(
     correction_bias: torch.Tensor,
     indices_dtype: torch.dtype,
     routed_scaling_factor: float,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens, num_experts = gating_output.shape
     shape = (num_tokens, _TOPK)
@@ -112,9 +119,11 @@ def dsv4_topk(
             correction_bias,
             topk_weights,
             topk_ids,
+            is_padding,
             routed_scaling_factor,
             NUM_EXPERTS=num_experts,
             BLOCK_N=triton.next_power_of_2(num_experts),
+            HAS_PADDING=is_padding is not None,
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )
