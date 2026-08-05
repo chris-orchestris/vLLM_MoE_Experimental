@@ -14,6 +14,10 @@ from vllm.model_executor.warmup.jit_warmup import (
     get_ast_full_name,
     zip_inputs,
 )
+from vllm.model_executor.warmup.kernel_warmup import (
+    _mhc_warmup_max_tokens,
+    _mhc_warmup_models,
+)
 
 
 def _next_power_of_2(value: int) -> int:
@@ -37,6 +41,47 @@ def _config(
         name=name,
         vectorized=vectorized,
     )
+
+
+@pytest.mark.parametrize(
+    ("scheduled_tokens", "expected"),
+    [(None, 6528), (6512, 6512)],
+)
+@pytest.mark.skip_global_cleanup
+def test_mhc_warmup_uses_scheduler_target_token_limit(
+    scheduled_tokens, expected
+) -> None:
+    scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=6528,
+        max_num_scheduled_tokens=scheduled_tokens,
+    )
+
+    assert _mhc_warmup_max_tokens(cast(Any, scheduler_config)) == expected
+
+
+@pytest.mark.parametrize("draft", [None, "target"])
+@pytest.mark.skip_global_cleanup
+def test_mhc_warmup_models_deduplicates_target(draft) -> None:
+    target = object()
+    draft_model = target if draft == "target" else None
+    worker = SimpleNamespace(
+        get_model=lambda: target,
+        get_draft_model=lambda: draft_model,
+    )
+
+    assert _mhc_warmup_models(cast(Any, worker)) == (target,)
+
+
+@pytest.mark.skip_global_cleanup
+def test_mhc_warmup_models_includes_speculative_draft() -> None:
+    target = object()
+    draft = object()
+    worker = SimpleNamespace(
+        get_model=lambda: target,
+        get_draft_model=lambda: draft,
+    )
+
+    assert _mhc_warmup_models(cast(Any, worker)) == (target, draft)
 
 
 class ToyKernel(VllmJitKernel["ToyKernel.CompileKey"]):

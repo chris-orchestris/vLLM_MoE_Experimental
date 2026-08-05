@@ -14,6 +14,7 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     GPTQ_MARLIN_TILE,
     apply_gptq_marlin_linear,
+    get_marlin_mxfp4_int8_prefill_threshold,
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_moe_padded_intermediate,
@@ -53,6 +54,38 @@ ODD_SHAPES = [
     (4640, 512),  # Nemotron-Super-120B q_proj shard at TP=4
 ]
 ALIGNED_SHAPES = [(64, 128), (128, 64), (256, 256), (4608, 4096)]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "tokens", "expected"),
+    [(None, None, 0), ("0", "384", 0), ("1", None, 512), ("1", "384", 384)],
+)
+@pytest.mark.skip_global_cleanup
+def test_marlin_mxfp4_int8_prefill_flag(monkeypatch, enabled, tokens, expected):
+    if enabled is not None:
+        monkeypatch.setenv("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL", enabled)
+    if tokens is not None:
+        monkeypatch.setenv("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL_TOKENS", tokens)
+
+    assert get_marlin_mxfp4_int8_prefill_threshold() == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL", "yes"),
+        ("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL_TOKENS", "0"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_marlin_mxfp4_int8_prefill_flag_rejects_invalid_values(
+    monkeypatch, name, value
+):
+    monkeypatch.setenv("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL", "1")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError):
+        get_marlin_mxfp4_int8_prefill_threshold()
 
 
 def _is_tile_aligned(size_n: int, size_k: int) -> bool:

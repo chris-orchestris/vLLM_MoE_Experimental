@@ -331,6 +331,21 @@ class TestEpFilterOnSyntheticMoeWeights:
         for name in expert_names:
             assert parse_expert_id(name) in local_ids
 
+    @pytest.mark.skip_global_cleanup
+    def test_weight_name_filter_skips_before_yield(self, synthetic_moe_files):
+        files, _ = synthetic_moe_files
+        loaded = dict(
+            safetensors_weights_iterator(
+                files,
+                False,
+                weight_name_filter=lambda name: "self_attn.q_proj" in name,
+            )
+        )
+
+        assert "model.layers.0.self_attn.q_proj.weight" not in loaded
+        assert "model.embed_tokens.weight" in loaded
+        assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in loaded
+
     def test_ep8_each_rank_gets_one_expert(self, synthetic_moe_files):
         files, _ = synthetic_moe_files
         all_expert_names = set()

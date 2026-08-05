@@ -29,25 +29,35 @@ def _has_tilelang_mhc() -> bool:
 
 HAS_TILELANG_MHC = _has_tilelang_mhc()
 HAS_AITER_MHC = is_aiter_found_and_supported()
+_SM8X_TILELANG_MHC_MAX_TOKENS = 256
 
 
 @torch.compiler.assume_constant_result
 def _is_sm8x() -> bool:
-    """SM8x (Ampere) has no working TileLang MHC path.
-
-    TileLang MHC kernels assume Hopper-class features (e.g. PDL) and produce
-    incorrect results on SM8x, the same failure mode as cutedsl/deep_gemm.
-    Route ``forward_cuda`` to the portable torch/triton fallbacks instead.
-    """
-    return (
-        current_platform.is_cuda() and current_platform.get_device_capability()[0] < 9
-    )
+    """Return whether the current CUDA device is SM8x."""
+    capability = current_platform.get_device_capability()
+    return current_platform.is_cuda() and capability is not None and capability[0] < 9
 
 
 @torch.compiler.assume_constant_result
 def _use_sm8x_triton_mhc() -> bool:
     """Enable the experimental fused MHC path only by explicit opt-in."""
     return _is_sm8x() and os.getenv("VLLM_DSV4_AMPERE_FUSED_MHC", "0") == "1"
+
+
+@torch.compiler.assume_constant_result
+def _use_sm8x_tilelang_mhc() -> bool:
+    """Enable the measured small-row TileLang path only by explicit opt-in."""
+    return (
+        _is_sm8x()
+        and HAS_TILELANG_MHC
+        and os.getenv("VLLM_DSV4_AMPERE_TILELANG_MHC", "0") == "1"
+    )
+
+
+def _use_sm8x_tilelang_mhc_for(tensor: torch.Tensor) -> bool:
+    num_tokens = tensor.numel() // (tensor.shape[-2] * tensor.shape[-1])
+    return _use_sm8x_tilelang_mhc() and num_tokens <= _SM8X_TILELANG_MHC_MAX_TOKENS
 
 
 # --8<-- [start:mhc_pre]
@@ -81,6 +91,21 @@ class MHCPreOp(CustomOp):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if _is_sm8x():
+            if _use_sm8x_tilelang_mhc_for(residual):
+                return torch.ops.vllm.mhc_pre_tilelang(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                    norm_weight,
+                    norm_eps,
+                )
             if _use_sm8x_triton_mhc():
                 return mhc_kernels.mhc_pre_triton(
                     residual,
@@ -260,6 +285,13 @@ class MHCPostOp(CustomOp):
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
         if _is_sm8x():
+            if _use_sm8x_tilelang_mhc_for(residual):
+                return torch.ops.vllm.mhc_post_tilelang(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                )
             if _use_sm8x_triton_mhc():
                 return mhc_kernels.mhc_post_triton(
                     x,
@@ -351,6 +383,16 @@ class HCHeadOp(CustomOp):
             hc_mult, hidden_size = hidden_states.shape[-2:]
             outer_shape = hidden_states.shape[:-2]
             hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+            if _use_sm8x_tilelang_mhc():
+                out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                    hs_flat,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    rms_norm_eps,
+                    hc_eps,
+                )
+                return out.view(*outer_shape, hidden_size)
             out = torch.empty(
                 hs_flat.shape[0],
                 hidden_size,
@@ -487,6 +529,25 @@ class MHCFusedPostPreOp(CustomOp):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if _is_sm8x():
+            if _use_sm8x_tilelang_mhc_for(residual):
+                return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                    tile_n,
+                    norm_weight,
+                    norm_eps,
+                )
             if _use_sm8x_triton_mhc():
                 return mhc_kernels.mhc_fused_post_pre_triton(
                     x,

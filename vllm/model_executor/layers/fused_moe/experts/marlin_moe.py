@@ -31,8 +31,12 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    silu_mul_per_token_quant_int8,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
+    get_marlin_mxfp4_int8_prefill_threshold,
     marlin_make_workspace_new,
     marlin_moe_intermediate_size,
     marlin_quant_input,
@@ -81,6 +85,20 @@ def _read_marlin_moe_exec_config(prefix: str) -> dict[str, int]:
 
 _MARLIN_MOE_GEMM1_EXEC_CONFIG = _read_marlin_moe_exec_config("VLLM_MARLIN_MOE_GEMM1")
 _MARLIN_MOE_GEMM2_EXEC_CONFIG = _read_marlin_moe_exec_config("VLLM_MARLIN_MOE_GEMM2")
+_MXFP4_INT8_LARGE_BATCH_EXEC_CONFIG = {
+    "thread_k": 64,
+    "thread_n": 256,
+    "blocks_per_sm": -1,
+}
+_MXFP4_INT8_ACTIVATION_SCALE_FACTOR = 1 / 1024
+
+
+def _mxfp4_int8_exec_config(
+    config: dict[str, int], use_mxfp4_int8: bool, num_tokens: int
+) -> dict[str, int]:
+    if use_mxfp4_int8 and num_tokens >= 512 and config["thread_k"] == -1:
+        return _MXFP4_INT8_LARGE_BATCH_EXEC_CONFIG
+    return config
 
 
 def _fused_marlin_moe(
@@ -154,10 +172,27 @@ def _fused_marlin_moe(
 
     intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
 
+    use_mxfp4_int8 = (
+        input_dtype == torch.int8 and quant_type == scalar_types.float4_e2m1f
+    )
+    gemm1_exec_config = _mxfp4_int8_exec_config(
+        _MARLIN_MOE_GEMM1_EXEC_CONFIG, use_mxfp4_int8, M
+    )
+    gemm2_exec_config = _mxfp4_int8_exec_config(
+        _MARLIN_MOE_GEMM2_EXEC_CONFIG, use_mxfp4_int8, M
+    )
+    int8_scratch = intermediate_cache2.view(torch.int8).flatten()
+
     a_scales1 = None
     gate_up_input = hidden_states
     if input_dtype == torch.int8:
-        gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+        scale_factor = _MXFP4_INT8_ACTIVATION_SCALE_FACTOR if use_mxfp4_int8 else 1.0
+        gate_up_out = None
+        if int8_scratch.numel() >= hidden_states.numel():
+            gate_up_out = int8_scratch[: hidden_states.numel()].view_as(hidden_states)
+        gate_up_input, a_scales1 = marlin_quant_input(
+            hidden_states, input_dtype, scale_factor, out=gate_up_out
+        )
         if input_global_scale1 is not None:
             a_scales1 = a_scales1 * input_global_scale1
     elif input_dtype == torch.float8_e4m3fn:
@@ -190,30 +225,56 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
-        **_MARLIN_MOE_GEMM1_EXEC_CONFIG,
+        **gemm1_exec_config,
     )
-    # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
-    # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
-    activation_func(
-        activation,
-        intermediate_cache2,
-        intermediate_cache1.view(-1, w13_num_shards * N),
-        clamp_limit=clamp_limit,
-        alpha=gemm1_alpha,
-        beta=gemm1_beta,
-        topk_ids=topk_ids,
-        expert_map=expert_map,
-        activation_situ_beta=activation_situ_beta,
-        activation_situ_linear_beta=activation_situ_linear_beta,
-    )
+    activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
+    fused_activation_quant = use_mxfp4_int8 and activation_func is apply_moe_activation
+    if fused_activation_quant:
+        if activation == MoEActivation.SILU:
+            activation_alpha = 1.0
+            activation_beta = 0.0
+        elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            activation_alpha = gemm1_alpha
+            activation_beta = gemm1_beta
+        else:
+            fused_activation_quant = False
+
+    a_scales2 = None
+    if fused_activation_quant:
+        quant_size = M * num_topk * N
+        quant_output = int8_scratch[:quant_size].view(M * num_topk, N)
+        intermediate_cache2, a_scales2 = silu_mul_per_token_quant_int8(
+            activation_input,
+            scale_factor=scale_factor,
+            clamp_limit=clamp_limit,
+            alpha=activation_alpha,
+            beta=activation_beta,
+            out=quant_output,
+        )
+        if input_global_scale2 is not None:
+            a_scales2 = a_scales2 * input_global_scale2
+    else:
+        # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit
+        # and SWIGLUOAI_UNINTERLEAVE both use the clamped SwiGLU kernel.
+        activation_func(
+            activation,
+            intermediate_cache2,
+            activation_input,
+            clamp_limit=clamp_limit,
+            alpha=gemm1_alpha,
+            beta=gemm1_beta,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
+        )
 
     if output is None:
         output = intermediate_cache3
 
-    a_scales2 = None
-    if input_dtype == torch.int8:
+    if input_dtype == torch.int8 and not fused_activation_quant:
         intermediate_cache2, a_scales2 = marlin_quant_input(
-            intermediate_cache2, input_dtype
+            intermediate_cache2, input_dtype, scale_factor
         )
         if input_global_scale2 is not None:
             a_scales2 = a_scales2 * input_global_scale2
@@ -249,7 +310,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
-        **_MARLIN_MOE_GEMM2_EXEC_CONFIG,
+        **gemm2_exec_config,
     )
 
     return output
@@ -633,6 +694,16 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
+        self.mxfp4_int8_prefill_threshold = (
+            get_marlin_mxfp4_int8_prefill_threshold()
+            if quant_config.use_mxfp4_w4a16
+            else 0
+        )
+        if self.mxfp4_int8_prefill_threshold and self.input_dtype is not None:
+            raise ValueError(
+                "The hybrid MXFP4 INT8 prefill path cannot be combined with "
+                "VLLM_MARLIN_INPUT_DTYPE"
+            )
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
         # Gated-activation params (used by SWIGLUOAI_UNINTERLEAVE on packed w13).
         # silu == swigluoai with alpha=1, beta=0; configs that don't set these
@@ -817,6 +888,13 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
+        input_dtype = self.input_dtype
+        if (
+            self.mxfp4_int8_prefill_threshold
+            and hidden_states.size(0) >= self.mxfp4_int8_prefill_threshold
+        ):
+            input_dtype = torch.int8
+
         ctx = self._lora_context
         if ctx is None:
             fused_marlin_moe(
@@ -856,7 +934,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices1=self.w13_g_idx_sort_indices,
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
-                input_dtype=self.input_dtype,
+                input_dtype=input_dtype,
                 clamp_limit=self.gemm1_clamp_limit,
                 gemm1_alpha=self.gemm1_alpha,
                 gemm1_beta=self.gemm1_beta,
@@ -985,7 +1063,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             sort_indices1=self.w13_g_idx_sort_indices,
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
-            input_dtype=self.input_dtype,
+            input_dtype=input_dtype,
             clamp_limit=self.gemm1_clamp_limit,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_beta=self.gemm1_beta,

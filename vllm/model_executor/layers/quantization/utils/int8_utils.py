@@ -74,6 +74,7 @@ def _per_token_quant_int8(
     stride_x,
     stride_xq,
     N,
+    scale_factor,
     BLOCK: tl.constexpr,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
@@ -84,7 +85,7 @@ def _per_token_quant_int8(
 
     x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
-    scale_x = absmax / 127
+    scale_x = absmax / 127 * scale_factor
     x_q = x * (127 / absmax)
     x_q = round_int8(x_q)
 
@@ -92,13 +93,18 @@ def _per_token_quant_int8(
     tl.store(scale_ptr + row_id, scale_x)
 
 
-def per_token_quant_int8(x):
+def per_token_quant_int8(x, scale_factor: float = 1.0, out: torch.Tensor | None = None):
     original_shape = x.shape
     if x.dim() > 2:
         x = x.view(-1, original_shape[-1])
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
-    x_q = torch.empty((M, N), device=x.device, dtype=torch.int8)
+    if out is None:
+        x_q = torch.empty((M, N), device=x.device, dtype=torch.int8)
+    else:
+        assert out.numel() == M * N
+        assert out.dtype == torch.int8 and out.is_contiguous()
+        x_q = out.view(M, N)
     scales = torch.empty((M, 1), device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
@@ -111,6 +117,7 @@ def per_token_quant_int8(x):
         stride_x=x.stride(-2),
         stride_xq=x_q.stride(-2),
         N=N,
+        scale_factor=scale_factor,
         BLOCK=BLOCK,
         num_warps=num_warps,
         num_stages=1,
@@ -118,6 +125,76 @@ def per_token_quant_int8(x):
     x_q = x_q.view(*original_shape)
     scales = scales.view(*original_shape[:-1], 1)
     return x_q, scales
+
+
+@triton.jit
+def _silu_mul_per_token_quant_int8(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    hidden_size,
+    scale_factor,
+    clamp_limit,
+    alpha,
+    beta,
+    HAS_CLAMP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < hidden_size
+    input_offset = row * hidden_size * 2 + cols
+    gate = tl.load(input_ptr + input_offset, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(input_ptr + input_offset + hidden_size, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    if HAS_CLAMP:
+        gate = tl.minimum(gate, clamp_limit)
+        up = tl.maximum(tl.minimum(up, clamp_limit), -clamp_limit) + beta
+    value = gate / (1.0 + tl.exp(-alpha * gate)) * up
+    absmax = tl.maximum(tl.max(tl.abs(value)), 1e-10)
+    output_scale = absmax / 127
+    quant = round_int8(value * (127 / absmax))
+    tl.store(output_ptr + row * hidden_size + cols, quant, mask=mask)
+    tl.store(scale_ptr + row, output_scale * scale_factor)
+
+
+def silu_mul_per_token_quant_int8(
+    x: torch.Tensor,
+    *,
+    scale_factor: float = 1.0,
+    clamp_limit: float | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply gated SiLU and dynamically quantize each output row to INT8."""
+    assert x.ndim == 2 and x.shape[-1] % 2 == 0
+    rows = x.shape[0]
+    hidden_size = x.shape[1] // 2
+    if out is None:
+        out = torch.empty((rows, hidden_size), device=x.device, dtype=torch.int8)
+    else:
+        assert out.shape == (rows, hidden_size)
+        assert out.dtype == torch.int8 and out.is_contiguous()
+    scales = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
+    block = triton.next_power_of_2(hidden_size)
+    num_warps = min(max(block // 256, 1), 8)
+    _silu_mul_per_token_quant_int8[(rows,)](
+        x,
+        out,
+        scales,
+        hidden_size,
+        scale_factor,
+        0.0 if clamp_limit is None else clamp_limit,
+        alpha,
+        beta,
+        HAS_CLAMP=clamp_limit is not None,
+        BLOCK=block,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out, scales
 
 
 @triton.jit

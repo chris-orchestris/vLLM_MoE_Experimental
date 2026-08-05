@@ -15,6 +15,7 @@ import torch
 from torch.nn import Parameter
 from torch.nn import functional as F
 
+import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe  # noqa
 from tests.kernels.moe.utils import (
     fused_moe,
@@ -42,8 +43,10 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_permute_bias,
+    marlin_permute_scales,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    mxfp4_marlin_process_scales,
     rand_marlin_weight_mxfp4_like,
     rand_marlin_weight_nvfp4_like,
 )
@@ -1050,6 +1053,111 @@ def test_fused_marlin_moe(
     )
 
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.usefixtures("default_vllm_config")
+def test_fused_marlin_moe_mxfp4_canonical_weights_int8_activations():
+    """The INT8 prefill kernel consumes the existing A16-packed MXFP4 weights."""
+    if current_platform.get_device_capability() < (8, 0):
+        pytest.skip("MXFP4 canonical-layout INT8 MMA requires SM80 or newer")
+
+    set_random_seed(1)
+    m, n, k, e, topk = 33, 256, 256, 5, 2
+    dtype = torch.bfloat16
+
+    def make_weight(size_n: int, size_k: int):
+        references = []
+        qweights = []
+        marlin_scales = []
+        perm = torch.empty(0, dtype=torch.int, device="cuda")
+        for _ in range(e):
+            packed = torch.randint(
+                0,
+                256,
+                (size_n, size_k // 2),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            scales = torch.randint(
+                119,
+                126,
+                (size_n, size_k // 32),
+                dtype=torch.uint8,
+                device="cuda",
+            ).view(torch.float8_e8m0fnu)
+
+            high = (packed & 0x80) | ((packed & 0x70) >> 2)
+            high = high.view(torch.float8_e4m3fn).to(dtype) * (2**6)
+            low = packed << 4
+            low = (low & 0x80) | ((low & 0x70) >> 2)
+            low = low.view(torch.float8_e4m3fn).to(dtype) * (2**6)
+            reference = torch.stack((low, high), dim=2).view(size_n, size_k)
+            reference *= scales.repeat_interleave(32, dim=1).to(dtype)
+            references.append(reference)
+
+            packed_t = packed.view(torch.int32).T.contiguous()
+            qweights.append(
+                ops.gptq_marlin_repack(
+                    packed_t,
+                    perm,
+                    size_k,
+                    size_n,
+                    4,
+                    False,
+                )
+            )
+            scale = marlin_permute_scales(
+                scales.T.to(dtype),
+                size_k,
+                size_n,
+                32,
+                is_a_8bit=False,
+            )
+            marlin_scales.append(mxfp4_marlin_process_scales(scale))
+
+        return (
+            torch.stack(references),
+            torch.stack(qweights).contiguous(),
+            torch.stack(marlin_scales).contiguous(),
+        )
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w1_ref, w1, w1_scale = make_weight(2 * n, k)
+    w2_ref, w2, w2_scale = make_weight(k, n)
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+
+    with set_current_vllm_config(vllm_config):
+        reference = torch_experts(
+            a,
+            w1_ref,
+            w2_ref,
+            topk_weights,
+            topk_ids,
+            global_num_experts=e,
+            quant_dtype=torch.int8,
+            per_act_token_quant=True,
+        )
+
+    output = fused_marlin_moe(
+        a,
+        w1,
+        w2,
+        None,
+        None,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        global_num_experts=e,
+        input_dtype=torch.int8,
+        quant_type_id=scalar_types.float4_e2m1f.id,
+    )
+
+    relative_error = (output.float() - reference.float()).abs().mean()
+    relative_error /= reference.float().abs().mean()
+    assert relative_error < 0.04
 
 
 @pytest.mark.flaky(reruns=2)

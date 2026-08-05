@@ -502,6 +502,25 @@ __device__ inline void dequant<int32_t, vllm::kU4B8.id(), true>(
 }
 
 template <>
+__device__ inline void dequant<int32_t, vllm::kFE2M1f.id(), true>(
+    int q, int32_t* frag_b) {
+  auto unpack = [](uint32_t packed) {
+    uint32_t code = packed & 0x0F0F0F0F;
+    // Look up four exact E2M1 magnitudes, scaled by two, with one PRMT.
+    uint32_t index = code & 0x07070707;
+    uint32_t paired = (index | (index >> 4)) & 0x00770077;
+    uint32_t selector = (paired | (paired >> 8)) & 0x00007777;
+    uint32_t magnitude = __byte_perm(0x03020100, 0x0C080604, selector);
+    uint32_t sign_mask = ((code >> 3) & 0x01010101) * 0xFF;
+    uint32_t negative = __vsub4(0, magnitude);
+    return (magnitude & ~sign_mask) | (negative & sign_mask);
+  };
+
+  frag_b[0] = unpack(q);
+  frag_b[1] = unpack(static_cast<uint32_t>(q) >> 4);
+}
+
+template <>
 __device__ inline void dequant<__nv_fp8x4_e4m3, vllm::kU4B8.id(), true>(
     int q, __nv_fp8x4_e4m3* frag_b) {
   int s = q & 0x08080808;

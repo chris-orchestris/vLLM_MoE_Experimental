@@ -108,6 +108,17 @@ QUANT_CONFIGS = [
         "thread_m_blocks": THREAD_M_BLOCKS,
         "group_blocks": [2],
     },
+    # MXFP4 with INT8 activation. The kernel consumes the same A16-packed
+    # weights and scales as the BF16 path.
+    {
+        "a_type": ["kS8"],
+        "b_type": "kFE2M1f",
+        "c_type": ["kBFloat16"],
+        "s_type": "kFE8M0fnu",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": [1, 2, 3, 4],
+        "group_blocks": [2],
+    },
     # MXFP8
     {
         "a_type": ["kBFloat16"],

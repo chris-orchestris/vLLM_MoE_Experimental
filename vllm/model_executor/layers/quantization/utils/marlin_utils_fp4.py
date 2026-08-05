@@ -10,6 +10,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     get_marlin_input_dtype,
+    get_marlin_mxfp4_int8_prefill_threshold,
     marlin_make_workspace_new,
     marlin_pad_dim,
     marlin_pad_qweight,
@@ -605,6 +606,11 @@ def prepare_moe_mxfp4_layer_for_marlin(
     Does NOT modify the layer in-place.
     """
     input_dtype = get_marlin_input_dtype()
+    hybrid_int8_prefill = get_marlin_mxfp4_int8_prefill_threshold() > 0
+    if hybrid_int8_prefill and input_dtype is not None:
+        raise RuntimeError(
+            "The hybrid MXFP4 INT8 prefill path requires A16-packed weights."
+        )
     if (
         input_dtype is not None
         and input_dtype.itemsize == 1
@@ -642,15 +648,39 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
     # WEIGHT SCALES: Permute scales
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
-        scales = scales.view(torch.float8_e8m0fnu)
-        scales = scales.to(param_dtype)
-
-        tensor_list = []
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
             size_n, size_k = k, n
 
+        if hybrid_int8_prefill:
+            scale_codes = scales.view(torch.uint8)
+            min_code = int(scale_codes.min().item())
+            max_code = int(scale_codes.max().item())
+            if min_code < 118 or max_code > 127:
+                raise ValueError(
+                    "Hybrid MXFP4 INT8 prefill requires E8M0 scale codes in "
+                    f"[118, 127], got [{min_code}, {max_code}] for {name}."
+                )
+            assert scales.shape == (e, size_n, size_k // group_size)
+            scale_multipliers = torch.bitwise_left_shift(
+                torch.ones_like(scale_codes, dtype=torch.int64),
+                scale_codes.to(torch.int64) - 118,
+            )
+            max_scale_sum = int(scale_multipliers.sum(dim=-1).max().item())
+            max_int32_scale_sum = torch.iinfo(torch.int32).max // (
+                group_size * 127 * 12
+            )
+            if max_scale_sum > max_int32_scale_sum:
+                raise ValueError(
+                    "Hybrid MXFP4 INT8 prefill could overflow its INT32 "
+                    f"accumulator for {name}: scale sum {max_scale_sum} "
+                    f"exceeds {max_int32_scale_sum}."
+                )
+        scales = scales.view(torch.float8_e8m0fnu)
+        scales = scales.to(param_dtype)
+
+        tensor_list = []
         for i in range(e):
             scale = scales[i].T
             marlin_scales = marlin_permute_scales(

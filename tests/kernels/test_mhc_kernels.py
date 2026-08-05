@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import vllm.model_executor.kernels.mhc  # noqa: F401
+import vllm.model_executor.layers.mhc as mhc_layer
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
@@ -19,6 +20,18 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [(24, True), (256, True), (257, False), (512, False)],
+)
+@pytest.mark.skip_global_cleanup
+def test_sm8x_tilelang_mhc_token_threshold(monkeypatch, num_tokens, expected):
+    monkeypatch.setattr(mhc_layer, "_use_sm8x_tilelang_mhc", lambda: True)
+    residual = torch.empty((num_tokens, 4, 8), device="cpu")
+
+    assert mhc_layer._use_sm8x_tilelang_mhc_for(residual) is expected
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
@@ -488,7 +501,7 @@ def test_hc_head_triton(num_tokens, hidden_size, hc_mult):
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
-def test_hc_head_tilelang(num_tokens, hidden_size, hc_mult):
+def test_hc_head_tilelang(monkeypatch, num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
@@ -498,7 +511,9 @@ def test_hc_head_tilelang(num_tokens, hidden_size, hc_mult):
     hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
     rms_eps = hc_eps = 1e-6
 
-    out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+    monkeypatch.setattr(mhc_layer, "_use_sm8x_tilelang_mhc", lambda: True)
+    out = mhc_layer.HCHeadOp.forward_cuda(
+        None,
         residual,
         fn,
         hc_scale,

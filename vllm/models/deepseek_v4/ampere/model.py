@@ -1516,6 +1516,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
+    def skip_weight_name_before_load(self, name: str) -> bool:
+        mapped_name = self.hf_to_vllm_mapper._map_name(name)
+        return mapped_name is None or "mtp." in mapped_name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

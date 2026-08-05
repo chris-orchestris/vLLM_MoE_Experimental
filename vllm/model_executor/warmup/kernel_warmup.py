@@ -43,12 +43,28 @@ from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
 
 if TYPE_CHECKING:
+    from vllm.config.scheduler import SchedulerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
 
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
+
+
+def _mhc_warmup_max_tokens(scheduler_config: "SchedulerConfig") -> int:
+    return (
+        scheduler_config.max_num_scheduled_tokens
+        or scheduler_config.max_num_batched_tokens
+    )
+
+
+def _mhc_warmup_models(worker: "Worker") -> tuple[torch.nn.Module, ...]:
+    model = worker.get_model()
+    draft_model = worker.get_draft_model()
+    if draft_model is None or draft_model is model:
+        return (model,)
+    return model, draft_model
 
 
 def _ll_bf16_router_shapes_from_model(
@@ -116,13 +132,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
-    deepseek_v4_mhc_warmup(
-        worker.get_model(),
-        max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
-    )
+    for model in _mhc_warmup_models(worker):
+        deepseek_v4_mhc_warmup(
+            model,
+            max_tokens=_mhc_warmup_max_tokens(worker.scheduler_config),
+            cudagraph_capture_sizes=(
+                worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+            ),
+        )
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:

@@ -3,6 +3,7 @@
 
 
 import math
+import os
 
 import numpy
 import torch
@@ -685,10 +686,28 @@ def get_marlin_input_dtype(prefix: str | None = None):
         return
 
 
-def marlin_quant_input(x: torch.Tensor, quant_dtype: torch.dtype):
+def get_marlin_mxfp4_int8_prefill_threshold() -> int:
+    enabled = os.getenv("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL", "0")
+    if enabled not in {"0", "1"}:
+        raise ValueError("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL must be either 0 or 1")
+    if enabled == "0":
+        return 0
+    value = os.getenv("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL_TOKENS", "512")
+    threshold = int(value)
+    if threshold < 1:
+        raise ValueError("VLLM_DSV4_AMPERE_MXFP4_INT8_PREFILL_TOKENS must be positive")
+    return threshold
+
+
+def marlin_quant_input(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    scale_factor: float = 1.0,
+    out: torch.Tensor | None = None,
+):
     x = x.reshape(-1, x.shape[-1])
     if quant_dtype == torch.int8:
-        return per_token_quant_int8(x)
+        return per_token_quant_int8(x, scale_factor, out=out)
     elif quant_dtype == torch.float8_e4m3fn:
         return get__quant_fp8_method()(x)
     else:

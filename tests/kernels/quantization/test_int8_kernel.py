@@ -12,11 +12,55 @@ from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_quant_int8,
+    silu_mul_per_token_quant_int8,
 )
 from vllm.platforms import current_platform
 
 if current_platform.get_device_capability() < (7, 0):
     pytest.skip("INT8 Triton requires CUDA 7.0 or higher", allow_module_level=True)
+
+
+@torch.inference_mode()
+def test_per_token_quant_int8_scale_factor_and_output_buffer():
+    x = torch.randn((3, 257), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty_like(x, dtype=torch.int8)
+
+    quant, scales = per_token_quant_int8(x, scale_factor=1 / 512, out=output)
+    reference_quant, reference_scales = per_token_quant_int8(x)
+
+    assert quant.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(quant, reference_quant, rtol=0, atol=0)
+    torch.testing.assert_close(scales * 512, reference_scales)
+
+
+@pytest.mark.parametrize(
+    "clamp_limit,alpha,beta",
+    [(None, 1.0, 0.0), (7.0, 1.7, 0.5)],
+)
+@torch.inference_mode()
+def test_silu_mul_per_token_quant_int8(clamp_limit, alpha, beta):
+    x = torch.randn((3, 514), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((3, 257), dtype=torch.int8, device="cuda")
+    gate, up = x.float().chunk(2, dim=-1)
+    if clamp_limit is not None:
+        gate = gate.clamp(max=clamp_limit)
+        up = up.clamp(min=-clamp_limit, max=clamp_limit) + beta
+    reference = gate * torch.sigmoid(alpha * gate) * up
+    absmax = reference.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    reference_quant = torch.round(reference * (127 / absmax)).to(torch.int8)
+
+    quant, scales = silu_mul_per_token_quant_int8(
+        x,
+        scale_factor=1 / 512,
+        clamp_limit=clamp_limit,
+        alpha=alpha,
+        beta=beta,
+        out=output,
+    )
+
+    assert quant.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(quant, reference_quant, rtol=0, atol=0)
+    torch.testing.assert_close(scales * 512, absmax / 127)
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
