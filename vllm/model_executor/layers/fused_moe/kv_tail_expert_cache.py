@@ -104,14 +104,10 @@ def attach_kv_tail_expert_cache(
         return layouts, align(required_bytes)
 
     base_layouts, base_required_bytes = make_layout(base_capacity)
-    base_borrowed_blocks = (
-        base_required_bytes + block_stride - 1
-    ) // block_stride
+    base_borrowed_blocks = (base_required_bytes + block_stride - 1) // block_stride
     base_fence_block = kv_cache_config.num_blocks - base_borrowed_blocks
 
-    burst_layouts: list[
-        list[tuple[torch.dtype, tuple[int, ...], int]]
-    ] = []
+    burst_layouts: list[list[tuple[torch.dtype, tuple[int, ...], int]]] = []
     burst_required_bytes = 0
     burst_borrowed_blocks = 0
     if burst_capacity > 0:
@@ -135,21 +131,25 @@ def attach_kv_tail_expert_cache(
         > base_fence_block * block_stride
     ):
         raise RuntimeError("KV-tail burst tier overlaps the durable tier")
-    configured_fence = int(
-        os.getenv("DSV4_MOE_KV_TAIL_CACHE_FENCE_BLOCK", "0")
-    )
-    if configured_fence and configured_fence != fence_block:
+    configured_fence = int(os.getenv("DSV4_MOE_KV_TAIL_CACHE_FENCE_BLOCK", "0"))
+    # The scheduler has one global block pool while uneven TP expert widths
+    # can give each worker a different local bank boundary.  A scheduler fence
+    # at or below the local boundary is conservative: it starts preferring
+    # low KV blocks early, and the worker still revokes its bank at the exact
+    # local boundary before those pages are written.  A fence above the local
+    # boundary is unsafe because the scheduler could write a still-borrowed
+    # page before the worker sees a crossing allocation.
+    if configured_fence and configured_fence > fence_block:
         raise RuntimeError(
-            "KV-tail worker/scheduler fence mismatch: "
+            "KV-tail scheduler fence is above the worker boundary: "
             f"computed {fence_block}, configured {configured_fence}"
         )
-    configured_base_fence = int(
-        os.getenv("DSV4_MOE_KV_TAIL_BASE_FENCE_BLOCK", "0")
-    )
-    if configured_base_fence and configured_base_fence != base_fence_block:
+    configured_base_fence = int(os.getenv("DSV4_MOE_KV_TAIL_BASE_FENCE_BLOCK", "0"))
+    if configured_base_fence and configured_base_fence > base_fence_block:
         raise RuntimeError(
-            "KV-tail durable-tier fence mismatch: "
-            f"computed {base_fence_block}, configured {configured_base_fence}"
+            "KV-tail durable-tier scheduler fence is above the worker "
+            f"boundary: computed {base_fence_block}, configured "
+            f"{configured_base_fence}"
         )
 
     def attach_tier(
@@ -178,9 +178,7 @@ def attach_kv_tail_expert_cache(
     # Attach the highest, durable tier first so it remains bank zero for the
     # existing provider API.  The lower burst tier can then be revoked without
     # disturbing the durable tier's buffers or residency metadata.
-    base_bank_index = attach_tier(
-        base_layouts, base_fence_block * block_stride
-    )
+    base_bank_index = attach_tier(base_layouts, base_fence_block * block_stride)
     tiers = [
         KVTailExpertCacheTier(
             name="base",
@@ -189,9 +187,7 @@ def attach_kv_tail_expert_cache(
         )
     ]
     if burst_capacity > 0:
-        burst_bank_index = attach_tier(
-            burst_layouts, fence_block * block_stride
-        )
+        burst_bank_index = attach_tier(burst_layouts, fence_block * block_stride)
         tiers.append(
             KVTailExpertCacheTier(
                 name="burst",
@@ -252,8 +248,7 @@ def maybe_disable_kv_tail_expert_cache(
             if bucket > state.logged_allocation_bucket:
                 state.logged_allocation_bucket = bucket
                 logger.info(
-                    "KV-tail scheduler allocation high-water block=%d, "
-                    "fence=%d",
+                    "KV-tail scheduler allocation high-water block=%d, fence=%d",
                     state.allocation_high_water,
                     state.fence_block,
                 )

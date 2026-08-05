@@ -508,10 +508,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.decode_threshold = next_n
         self.reorder_batch_threshold = None
         # NOTE: SM100 datacenter GPUs support any next_n natively via the
-        # multi-atom paged MQA logits kernels (FP8 and FP4 indexer
-        # caches). Outside the SM100 family the FP8
-        # paged MQA logits kernel only supports next_n in (1, 2)
-        # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
+        # multi-atom paged MQA logits kernels (FP8 and FP4 indexer caches).
+        # Outside the SM100 family, flatten larger speculative groups. The SM8x
+        # kernel can compute multiple atoms correctly, but flattened next_n=1
+        # kernels are faster on Ampere because they use fewer registers and
+        # sustain higher occupancy.
         self.use_flattening = not current_platform.is_device_capability_family(
             100
         ) and next_n not in (1, 2)
@@ -953,7 +954,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if (
                 current_platform.is_cuda()
                 and has_deep_gemm()
-                and current_platform.get_device_capability()[0] >= 9
+                and current_platform.has_device_capability(90)
             ):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,

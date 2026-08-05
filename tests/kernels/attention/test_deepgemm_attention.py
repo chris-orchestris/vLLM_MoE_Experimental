@@ -308,3 +308,94 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits():
                 ref_logits = ref_logits.masked_fill(~mask, 0)
                 diff = calc_diff(logits, ref_logits)
                 assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_ampere_e4m3fn_bit_conversion_is_exact():
+    from vllm.models.deepseek_v4.ampere.ampere_indexer_logits import (
+        fp8_e4m3fn_to_bf16_sm86_triton,
+    )
+
+    fp8 = torch.arange(256, device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+    actual = fp8_e4m3fn_to_bf16_sm86_triton(fp8)
+    expected = fp8.to(torch.bfloat16)
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("next_n", [1, 2, 5, 8])
+def test_ampere_multi_atom_paged_mqa_logits_matches_reference(next_n: int):
+    from vllm.models.deepseek_v4.ampere.ampere_indexer_logits import (
+        _fp8_paged_mqa_logits_pyref,
+        fp8_paged_mqa_logits_sm86_triton,
+    )
+
+    torch.manual_seed(0)
+    batch_size, heads, index_dim = 2, 64, 128
+    block_size, max_model_len = 64, 256
+    num_blocks = batch_size * cdiv(max_model_len, block_size)
+
+    q_fp8 = torch.randn(
+        batch_size,
+        next_n,
+        heads,
+        index_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    k = torch.randn(
+        num_blocks,
+        block_size,
+        index_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k_amax = k.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
+    k_scale = k_amax / 448.0
+    k_fp8 = (k / k_scale).to(torch.float8_e4m3fn)
+    kv_cache = torch.empty(
+        num_blocks,
+        block_size,
+        1,
+        index_dim + 4,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    kv_cache[..., :index_dim].copy_(k_fp8.view(torch.uint8).unsqueeze(-2))
+    kv_cache[..., index_dim:].copy_(k_scale.view(torch.uint8).unsqueeze(-2))
+
+    weights = torch.randn(
+        batch_size * next_n, heads, device="cuda", dtype=torch.float32
+    )
+    context_base = torch.tensor([193, 177], device="cuda", dtype=torch.int32)
+    context_lens = context_base.unsqueeze(1) + torch.arange(
+        next_n, device="cuda", dtype=torch.int32
+    )
+    block_tables = torch.arange(num_blocks, device="cuda", dtype=torch.int32).view(
+        batch_size, -1
+    )
+
+    actual = fp8_paged_mqa_logits_sm86_triton(
+        q_fp8,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        False,
+    )
+    expected = _fp8_paged_mqa_logits_pyref(
+        q_fp8,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        False,
+    )
+
+    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
+    valid = positions < context_lens.flatten().unsqueeze(1)
+    diff = calc_diff(actual.masked_fill(~valid, 0), expected.masked_fill(~valid, 0))
+    assert diff < 1e-3, f"{diff=}"

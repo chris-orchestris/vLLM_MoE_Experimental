@@ -10,12 +10,11 @@
 // Gather immutable packed scale rows from pageable backing into one
 // preallocated pinned transfer slab. Keeping this native avoids one Python /
 // ATen dispatch per expert while preserving a single asynchronous H2D copy.
-extern "C" int vllm_cpu_gather_u8_rows(
-    std::uintptr_t destination,
-    std::uintptr_t source,
-    std::uintptr_t row_indices,
-    std::size_t row_bytes,
-    std::size_t row_count) {
+extern "C" int vllm_cpu_gather_u8_rows(std::uintptr_t destination,
+                                       std::uintptr_t source,
+                                       std::uintptr_t row_indices,
+                                       std::size_t row_bytes,
+                                       std::size_t row_count) {
   if (destination == 0 || source == 0 || row_indices == 0 || row_bytes == 0) {
     return 1;
   }
@@ -23,9 +22,10 @@ extern "C" int vllm_cpu_gather_u8_rows(
   const auto* source_bytes = reinterpret_cast<const std::uint8_t*>(source);
   const auto* indices = reinterpret_cast<const std::int64_t*>(row_indices);
   for (std::size_t row = 0; row < row_count; ++row) {
-    std::memcpy(destination_bytes + row * row_bytes,
-                source_bytes + static_cast<std::size_t>(indices[row]) * row_bytes,
-                row_bytes);
+    std::memcpy(
+        destination_bytes + row * row_bytes,
+        source_bytes + static_cast<std::size_t>(indices[row]) * row_bytes,
+        row_bytes);
   }
   return 0;
 }
@@ -34,12 +34,8 @@ extern "C" int vllm_cpu_gather_u8_rows(
 // layout. This shim needs only a C++ compiler and libcudart; it contains no
 // device code and therefore does not require nvcc.
 extern "C" int vllm_cuda_batch_copy_host_to_device(
-    std::uintptr_t* destinations,
-    std::uintptr_t* sources,
-    std::size_t* sizes,
-    std::size_t count,
-    std::uintptr_t stream_handle,
-    int device) {
+    std::uintptr_t* destinations, std::uintptr_t* sources, std::size_t* sizes,
+    std::size_t count, std::uintptr_t stream_handle, int device) {
   cudaError_t error = cudaSetDevice(device);
   if (error != cudaSuccess) {
     return static_cast<int>(error);
@@ -52,13 +48,33 @@ extern "C" int vllm_cuda_batch_copy_host_to_device(
   std::size_t attribute_index = 0;
   return static_cast<int>(cudaMemcpyBatchAsync(
       reinterpret_cast<void* const*>(destinations),
-      reinterpret_cast<const void* const*>(sources),
-      sizes,
-      count,
-      &attributes,
-      &attribute_index,
-      1,
-      reinterpret_cast<cudaStream_t>(stream_handle)));
+      reinterpret_cast<const void* const*>(sources), sizes, count, &attributes,
+      &attribute_index, 1, reinterpret_cast<cudaStream_t>(stream_handle)));
+}
+
+// Submit an ordered mixture of same-device and pinned-host-to-device copies
+// with one Python-to-C transition. The caller deliberately expands victim
+// swaps into dependency order (bank -> scratch, primary -> bank, scratch ->
+// primary), so ordinary stream ordering is sufficient and overlapping source
+// and destination rows are never live in the same operation.
+extern "C" int vllm_cuda_ordered_copy_async(
+    std::uintptr_t* destinations, std::uintptr_t* sources, std::size_t* sizes,
+    std::size_t count, std::uintptr_t stream_handle, int device) {
+  cudaError_t error = cudaSetDevice(device);
+  if (error != cudaSuccess) {
+    return static_cast<int>(error);
+  }
+
+  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+  for (std::size_t copy = 0; copy < count; ++copy) {
+    error = cudaMemcpyAsync(reinterpret_cast<void*>(destinations[copy]),
+                            reinterpret_cast<const void*>(sources[copy]),
+                            sizes[copy], cudaMemcpyDefault, stream);
+    if (error != cudaSuccess) {
+      return static_cast<int>(error);
+    }
+  }
+  return static_cast<int>(cudaSuccess);
 }
 
 // Queue a complete full-duplex expert-swap wave with one Python-to-C
@@ -71,17 +87,11 @@ extern "C" int vllm_cuda_batch_copy_host_to_device(
 // instead of returning to Python for every expert. The caller installs the
 // corresponding crossed wait against the preceding *wave* before entry.
 extern "C" int vllm_cuda_exclusive_expert_swap_wave_async(
-    std::uintptr_t* gpu_destinations,
-    std::uintptr_t* host_sources,
-    std::uintptr_t* host_destinations,
-    std::uintptr_t* gpu_sources,
-    std::size_t* sizes,
-    std::size_t swap_count,
-    std::size_t copies_per_swap,
-    std::uintptr_t h2d_stream_handle,
-    std::uintptr_t d2h_stream_handle,
-    std::uintptr_t h2d_event_handle,
-    std::uintptr_t d2h_event_handle,
+    std::uintptr_t* gpu_destinations, std::uintptr_t* host_sources,
+    std::uintptr_t* host_destinations, std::uintptr_t* gpu_sources,
+    std::size_t* sizes, std::size_t swap_count, std::size_t copies_per_swap,
+    std::uintptr_t h2d_stream_handle, std::uintptr_t d2h_stream_handle,
+    std::uintptr_t h2d_event_handle, std::uintptr_t d2h_event_handle,
     int device) {
   if (swap_count == 0 || copies_per_swap == 0 || h2d_event_handle == 0 ||
       d2h_event_handle == 0) {
@@ -115,12 +125,8 @@ extern "C" int vllm_cuda_exclusive_expert_swap_wave_async(
     error = cudaMemcpyBatchAsync(
         reinterpret_cast<void* const*>(gpu_destinations + offset),
         reinterpret_cast<const void* const*>(host_sources + offset),
-        sizes + offset,
-        copies_per_swap,
-        &h2d_attributes,
-        &h2d_attribute_index,
-        1,
-        h2d_stream);
+        sizes + offset, copies_per_swap, &h2d_attributes, &h2d_attribute_index,
+        1, h2d_stream);
     if (error != cudaSuccess) {
       return static_cast<int>(error);
     }
@@ -128,12 +134,8 @@ extern "C" int vllm_cuda_exclusive_expert_swap_wave_async(
     error = cudaMemcpyBatchAsync(
         reinterpret_cast<void* const*>(host_destinations + offset),
         reinterpret_cast<const void* const*>(gpu_sources + offset),
-        sizes + offset,
-        copies_per_swap,
-        &d2h_attributes,
-        &d2h_attribute_index,
-        1,
-        d2h_stream);
+        sizes + offset, copies_per_swap, &d2h_attributes, &d2h_attribute_index,
+        1, d2h_stream);
     if (error != cudaSuccess) {
       return static_cast<int>(error);
     }

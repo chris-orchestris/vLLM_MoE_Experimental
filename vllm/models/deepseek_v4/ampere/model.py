@@ -70,6 +70,18 @@ _NAN_PASS = [0]
 _LOGIT_PROBE_N = [0]
 
 
+def _needs_mtp_hidden_states(spec_config: typing.Any | None) -> bool:
+    """Whether the target must retain pre-hc-head states for its drafter.
+
+    DSpark consumes auxiliary states from its configured target layers instead
+    of the native-MTP/eagle residual stream.  Avoid allocating and refreshing
+    the large ``max_num_batched_tokens * hc_dim`` buffer for that path.
+    """
+    return spec_config is not None and (
+        spec_config.use_eagle() or spec_config.uses_draft_model()
+    )
+
+
 def _nan_probe_logits(hidden, logits, lm_head) -> None:
     """Probe the lm_head/logits path across passes (VLLM_SM86_NAN_PROBE=1).
 
@@ -96,8 +108,10 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
 
     if call == 0:
         w = getattr(lm_head, "weight", None)
-        print(f"[LOGIT_PROBE] lm_head.weight: {_stat(w)} "
-              f"type={type(lm_head).__name__}", flush=True)
+        print(
+            f"[LOGIT_PROBE] lm_head.weight: {_stat(w)} type={type(lm_head).__name__}",
+            flush=True,
+        )
     # last-row logits -> top-6 token ids the sampler will pick from
     lf = logits.detach().float()
     row = lf[-1] if lf.dim() == 2 else lf
@@ -105,8 +119,11 @@ def _nan_probe_logits(hidden, logits, lm_head) -> None:
     top = torch.topk(finite, 6)
     ids = top.indices.tolist()
     vals = [round(v, 2) for v in top.values.tolist()]
-    print(f"[LOGIT_PROBE call{call} pass{_NAN_PASS[0]}] logits {_stat(logits)} "
-          f"argmax_ids={ids} vals={vals}", flush=True)
+    print(
+        f"[LOGIT_PROBE call{call} pass{_NAN_PASS[0]}] logits {_stat(logits)} "
+        f"argmax_ids={ids} vals={vals}",
+        flush=True,
+    )
 
 
 def _nan_probe(name: str, x: torch.Tensor) -> None:
@@ -754,9 +771,7 @@ class DeepseekV4MoE(nn.Module):
         if self.use_mega_moe:
             self._init_mega_moe_experts(vllm_config, config, prefix)
         else:
-            self._init_fused_moe_experts(
-                vllm_config, config, quant_config, prefix
-            )
+            self._init_fused_moe_experts(vllm_config, config, quant_config, prefix)
 
     def _init_mega_moe_experts(
         self,
@@ -1144,11 +1159,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
-        # Pre-hc_head residual stream buffer for the MTP draft. Stable
-        # address so the copy_ in forward() refreshes it correctly across
-        # captured shapes. Only allocated on the last PP rank — that's
-        # where MTP target hidden states are produced.
-        if get_pp_group().is_last_rank:
+        # Pre-hc_head residual stream buffer for native MTP/eagle drafts.
+        # DSpark consumes aux_hidden_states instead, so allocating and copying
+        # this buffer would waste HBM and prefill bandwidth.
+        spec_config = vllm_config.speculative_config
+        if get_pp_group().is_last_rank and _needs_mtp_hidden_states(spec_config):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1219,11 +1234,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             _nan_probe(f"layer{_li}", hidden_states)
             if _li + 1 in self.aux_hidden_state_layers:
-                aux_recon = layer.hc_post(
-                    hidden_states, residual, post_mix, res_mix
-                )
-                aux_hidden_states.append(aux_recon.mean(dim=1))
-                final_aux_recon = aux_recon
+                if _li + 1 == self.end_layer:
+                    final_aux_recon = layer.hc_post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_states.append(final_aux_recon.mean(dim=1))
+                else:
+                    aux_hidden_states.append(
+                        layer.hc_post(hidden_states, residual, post_mix, res_mix).mean(
+                            dim=1
+                        )
+                    )
         # The fused path defers the final hc_post to the next layer's
         # fused_post_pre. After the last layer we must apply it explicitly.
         if layer is not None:
@@ -1239,9 +1260,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        # Stash pre-hc_head residual only for draft methods that consume it.
+        if self._mtp_hidden_buffer is not None:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = self.hc_head_op(
             hidden_states,

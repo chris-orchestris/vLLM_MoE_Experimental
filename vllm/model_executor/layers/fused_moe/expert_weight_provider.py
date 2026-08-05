@@ -3,6 +3,7 @@
 
 import ctypes
 import importlib.util
+import json
 import math
 import mmap
 import os
@@ -11,13 +12,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Literal
+from typing import Literal, TextIO
 
 import numpy as np
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.gpu_resident_expert_cache import (
+    GpuResidentExpertCache,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -27,6 +31,7 @@ _STATS_LOG_INTERVAL = 64
 
 _BATCH_COPY_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _EXCLUSIVE_SWAP_FUNCTIONS: dict[str, Callable[..., int]] = {}
+_ORDERED_COPY_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _PACKED_SCALE_GATHER_FUNCTIONS: dict[str, Callable[..., int]] = {}
 _REGISTERED_HOST_ALLOCATIONS: list[tuple[mmap.mmap, int, int]] = []
 _WRITE_COMBINED_HOST_ALLOCATIONS: list[tuple[ctypes.c_void_p, object]] = []
@@ -53,6 +58,16 @@ class _PackedScaleHostArena:
 
 _PACKED_SCALE_SCRATCH: dict[tuple[int, int, int, int], _PackedScaleTransferScratch] = {}
 _PACKED_SCALE_HOST_ARENAS: dict[tuple[int, int, int], _PackedScaleHostArena] = {}
+
+
+@dataclass
+class _DecodeVictimScratch:
+    tensors: list[torch.Tensor]
+    ready: torch.Event
+    used: bool = False
+
+
+_DECODE_VICTIM_SCRATCH: dict[tuple[object, ...], _DecodeVictimScratch] = {}
 
 
 @triton.jit
@@ -221,6 +236,27 @@ def _load_exclusive_swap_function(library_path: str) -> Callable[..., int]:
     return function
 
 
+def _load_ordered_copy_function(library_path: str) -> Callable[..., int]:
+    function = _ORDERED_COPY_FUNCTIONS.get(library_path)
+    if function is not None:
+        return function
+
+    library = ctypes.CDLL(library_path)
+    function = library.vllm_cuda_ordered_copy_async
+    pointer_array = ctypes.POINTER(ctypes.c_uint64)
+    function.argtypes = [
+        pointer_array,
+        pointer_array,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_uint64,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    _ORDERED_COPY_FUNCTIONS[library_path] = function
+    return function
+
+
 def _load_packed_scale_gather_function(library_path: str) -> Callable[..., int]:
     function = _PACKED_SCALE_GATHER_FUNCTIONS.get(library_path)
     if function is not None:
@@ -252,6 +288,56 @@ def _pinned_cpu_copy(src: torch.Tensor) -> torch.Tensor:
     dst = torch.empty_like(src, device="cpu", pin_memory=True)
     dst.copy_(src)
     return dst
+
+
+def _write_combined_cpu_copy(src: torch.Tensor) -> torch.Tensor:
+    """Move a CPU expert tensor into persistent write-combined host memory.
+
+    The model parameter retains the source ``Tensor`` object after provider
+    construction.  Merely returning a new WC tensor would therefore keep both
+    complete backing stores alive and can make a large offloaded model thrash.
+    Repoint the original CPU tensor at the populated WC storage so its old
+    pinned allocation can be reclaimed immediately.  Emptying PyTorch's host
+    cache is intentional: otherwise that allocator retains every displaced
+    multi-GiB block until model construction finishes, recreating the same RAM
+    peak.  A non-CPU source is not expected for host expert caching, but
+    retains copy semantics defensively.
+    """
+    dst = write_combined_host_empty(*src.shape, dtype=src.dtype)
+    dst.copy_(src)
+    if src.device.type == "cpu":
+        release_pinned_cache = src.is_pinned()
+        with torch.no_grad():
+            src.set_(dst)
+        if release_pinned_cache:
+            # This is the CUDA-host allocator hook used by torch.cuda.graph;
+            # the public accelerator-level wrapper does not clear this pool in
+            # the CUDA 13 / PyTorch nightly runtime used by this backend.
+            torch._C._host_emptyCache()
+        return src
+    return dst
+
+
+def _get_decode_victim_scratch(
+    tensors: list[torch.Tensor],
+) -> _DecodeVictimScratch:
+    """Return one expert-sized scratch bank shared by compatible GPU layers."""
+    device = tensors[0].device
+    key: tuple[object, ...] = (
+        device.type,
+        device.index,
+        tuple(
+            (tuple(tensor.shape[1:]), tensor.dtype, tensor.device) for tensor in tensors
+        ),
+    )
+    scratch = _DECODE_VICTIM_SCRATCH.get(key)
+    if scratch is None:
+        scratch = _DecodeVictimScratch(
+            tensors=[torch.empty_like(tensor[:1]) for tensor in tensors],
+            ready=current_platform.Event(),
+        )
+        _DECODE_VICTIM_SCRATCH[key] = scratch
+    return scratch
 
 
 def _pack_three_bit_scale_matrix(
@@ -498,6 +584,7 @@ class _BorrowedExpertBank:
     mapping: torch.Tensor
     mapping_host: torch.Tensor
     slots: dict[int, int]
+    lfru: dict[int, list[int]]
     free_slots: list[int]
     enabled: bool = True
 
@@ -686,7 +773,53 @@ class CachedWeightProvider:
             raise ValueError("VLLM_MOE_ROUTE_STATS_MIN_TOKENS must be >= 0")
         self._route_stats_arm_file = os.getenv("VLLM_MOE_ROUTE_STATS_ARM_FILE", "")
         self._route_stats_logged = False
+        self._async_expert_map = os.getenv(
+            "VLLM_MOE_ASYNC_EXPERT_MAP", "0"
+        ).lower() in {"1", "true"}
         self._borrowed_banks: list[_BorrowedExpertBank] = []
+        self._gpu_resident_cache_requested = os.getenv(
+            "VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE", "0"
+        ).lower() in {"1", "true"}
+        self._gpu_resident_max_tokens = int(
+            os.getenv("VLLM_MOE_GPU_RESIDENT_MAX_TOKENS", "24")
+        )
+        if self._gpu_resident_max_tokens < 0:
+            raise ValueError("VLLM_MOE_GPU_RESIDENT_MAX_TOKENS must be >= 0")
+        self._decode_victim_enabled = os.getenv(
+            "VLLM_MOE_KV_TAIL_DECODE_VICTIM", "0"
+        ).lower() in {"1", "true"}
+        self._decode_victim_max_tokens = int(
+            os.getenv("VLLM_MOE_KV_TAIL_DECODE_VICTIM_MAX_TOKENS", "24")
+        )
+        if self._decode_victim_max_tokens < 0:
+            raise ValueError("VLLM_MOE_KV_TAIL_DECODE_VICTIM_MAX_TOKENS must be >= 0")
+        if self._decode_victim_enabled and exclusive:
+            raise ValueError(
+                "KV-tail decode victim caching is incompatible with exclusive "
+                "expert caching"
+            )
+        self.decode_victim_hits = 0
+        self.decode_victim_stashes = 0
+        self._cache_trace_max_tokens = int(
+            os.getenv("VLLM_MOE_CACHE_TRACE_MAX_TOKENS", "0")
+        )
+        if self._cache_trace_max_tokens < 0:
+            raise ValueError("VLLM_MOE_CACHE_TRACE_MAX_TOKENS must be >= 0")
+        self._cache_trace_call_index = 0
+        self._cache_trace_file: TextIO | None = None
+        self._cache_trace_arm_file = os.getenv("VLLM_MOE_CACHE_TRACE_ARM_FILE", "")
+        cache_trace_dir = os.getenv("VLLM_MOE_CACHE_TRACE_DIR", "")
+        if (
+            cache_trace_dir
+            and self._cache_trace_max_tokens > 0
+            and int(os.getenv("LOCAL_RANK", "0")) == 0
+        ):
+            trace_path = Path(cache_trace_dir)
+            trace_path.mkdir(parents=True, exist_ok=True)
+            safe_name = self.name.replace("/", "_").replace(".", "_")
+            self._cache_trace_file = (trace_path / f"{safe_name}.jsonl").open(
+                "a", encoding="utf-8"
+            )
 
         # Long prefills route enough token/expert pairs that they touch every
         # expert in practice. Discovering that set with unique().tolist()
@@ -767,12 +900,18 @@ class CachedWeightProvider:
         # wasteful and, more importantly, the pinned allocator may retain each
         # released full-size allocation until all layers have been converted.
         # That defeats the RAM-saving mode during load and can force swapping.
-        self._cpu_w13: torch.Tensor = (
-            w13_weight if exclusive else _pinned_cpu_copy(w13_weight)
+        write_combined_backing = os.getenv(
+            "VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED", "0"
+        ).lower() in {"1", "true"}
+        if write_combined_backing and exclusive:
+            raise ValueError(
+                "write-combined expert backing is incompatible with exclusive mode"
+            )
+        host_copy = (
+            _write_combined_cpu_copy if write_combined_backing else _pinned_cpu_copy
         )
-        self._cpu_w2: torch.Tensor = (
-            w2_weight if exclusive else _pinned_cpu_copy(w2_weight)
-        )
+        self._cpu_w13: torch.Tensor = w13_weight if exclusive else host_copy(w13_weight)
+        self._cpu_w2: torch.Tensor = w2_weight if exclusive else host_copy(w2_weight)
 
         device_capacity = capacity + 1 if exclusive else capacity
 
@@ -808,12 +947,8 @@ class CachedWeightProvider:
                     cuda_device,
                 )
             else:
-                self._cpu_w13_scale = (
-                    w13_scale if exclusive else _pinned_cpu_copy(w13_scale)
-                )
-                self._cpu_w2_scale = (
-                    w2_scale if exclusive else _pinned_cpu_copy(w2_scale)
-                )
+                self._cpu_w13_scale = w13_scale if exclusive else host_copy(w13_scale)
+                self._cpu_w2_scale = w2_scale if exclusive else host_copy(w2_scale)
             if self._mapped_scales:
                 default_banks = math.ceil(num_experts / capacity)
                 mapped_scale_banks = int(
@@ -904,6 +1039,41 @@ class CachedWeightProvider:
         if exclusive:
             self._initialize_exclusive_backing(cuda_device)
 
+        self._decode_victim_copy_function: Callable[..., int] | None = None
+        self._decode_victim_scratch: _DecodeVictimScratch | None = None
+        self._decode_victim_destinations: ctypes.Array[ctypes.c_uint64] | None = None
+        self._decode_victim_sources: ctypes.Array[ctypes.c_uint64] | None = None
+        self._decode_victim_sizes: ctypes.Array[ctypes.c_size_t] | None = None
+        if self._decode_victim_enabled:
+            if self._packed_scales or self._mapped_scales:
+                raise ValueError(
+                    "KV-tail decode victim caching currently requires ordinary "
+                    "GPU-resident expert scales"
+                )
+            bundled_library = Path(__file__).with_name("cuda_expert_cache_helper.so")
+            library_path = os.getenv(
+                "VLLM_MOE_KV_TAIL_DECODE_VICTIM_LIBRARY",
+                str(bundled_library),
+            )
+            if not Path(library_path).is_file():
+                raise RuntimeError(
+                    "KV-tail decode victim caching requires the native helper at "
+                    f"{library_path}; run tools/install_moe_experimental.sh or set "
+                    "VLLM_MOE_KV_TAIL_DECODE_VICTIM_LIBRARY"
+                )
+            self._decode_victim_copy_function = _load_ordered_copy_function(
+                library_path
+            )
+            gpu_tensors = [self._buf_w13, self._buf_w2]
+            if self._buf_w13_scale is not None:
+                assert self._buf_w2_scale is not None
+                gpu_tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
+            self._decode_victim_scratch = _get_decode_victim_scratch(gpu_tensors)
+            max_copies = capacity * len(gpu_tensors) * 3
+            self._decode_victim_destinations = (ctypes.c_uint64 * max_copies)()
+            self._decode_victim_sources = (ctypes.c_uint64 * max_copies)()
+            self._decode_victim_sizes = (ctypes.c_size_t * max_copies)()
+
         # LFRU state: {expert_id: [slot, freq, last_access_clock]}
         # Eviction score = freq / (clock - last_access + 1). Lower = evict first.
         if exclusive:
@@ -936,14 +1106,18 @@ class CachedWeightProvider:
         self._batched_copy_stream: torch.cuda.Stream | None = None
         self._batched_copy_ready: torch.cuda.Event | None = None
         if self._batched_copy_min_experts > 0:
-            library_path = os.getenv("VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY")
-            if not library_path:
+            batched_copy_library = os.getenv(
+                "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY"
+            )
+            if not batched_copy_library:
                 raise RuntimeError(
                     "VLLM_MOE_EXPERT_CACHE_BATCHED_MEMCPY_LIBRARY must point "
                     "to the built CUDA batch-copy shim when batched expert "
                     "copies are enabled"
                 )
-            self._batched_copy_function = _load_batch_copy_function(library_path)
+            self._batched_copy_function = _load_batch_copy_function(
+                batched_copy_library
+            )
             self._batched_copy_stream = torch.cuda.Stream(device=cuda_device)
             self._batched_copy_ready = torch.cuda.Event()
             logger.info_once(
@@ -1038,6 +1212,42 @@ class CachedWeightProvider:
                 )
                 if self._lookahead_registry_key is not None:
                     _INTERLAYER_PROVIDERS[self._lookahead_registry_key] = self
+
+        self._gpu_resident_cache: GpuResidentExpertCache | None = None
+        if self._gpu_resident_cache_requested:
+            if exclusive:
+                raise ValueError(
+                    "GPU-resident expert caching is incompatible with exclusive mode"
+                )
+            if split != "expert":
+                raise ValueError(
+                    "GPU-resident expert caching currently requires expert split"
+                )
+            if self._packed_scales or self._mapped_scales:
+                raise ValueError(
+                    "GPU-resident expert caching requires ordinary pinned scales"
+                )
+            host_tensors = [self._cpu_w13, self._cpu_w2]
+            device_tensors = [self._buf_w13, self._buf_w2]
+            if self._cpu_w13_scale is not None:
+                assert self._cpu_w2_scale is not None
+                assert self._buf_w13_scale is not None
+                assert self._buf_w2_scale is not None
+                host_tensors.extend([self._cpu_w13_scale, self._cpu_w2_scale])
+                device_tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
+            self._gpu_resident_cache = GpuResidentExpertCache(
+                num_experts=num_experts,
+                capacity=capacity,
+                host_tensors=host_tensors,
+                device_tensors=device_tensors,
+                mapping=self._mapping,
+                mapped_alias=_mapped_cuda_alias,
+            )
+            logger.info_once(
+                "Enabled experimental GPU-resident expert-cache planning and "
+                "mapped-host gathers.",
+                scope="global",
+            )
 
     def _initialize_packed_scale_backing(
         self,
@@ -1736,10 +1946,15 @@ class CachedWeightProvider:
                 (self._num_experts,), -1, dtype=torch.int32
             ).pin_memory(),
             slots={},
+            lfru={},
             free_slots=list(range(capacity - 1, -1, -1)),
         )
         self._borrowed_banks.append(bank)
-        return len(self._borrowed_banks) - 1
+        bank_index = len(self._borrowed_banks) - 1
+        gpu_cache = self._gpu_resident_cache
+        if bank_index == 0 and self._decode_victim_enabled and gpu_cache is not None:
+            gpu_cache.attach_victim_tensors(self._decode_victim_bank_tensors(bank))
+        return bank_index
 
     def disable_borrowed_buffers(self, bank_index: int = 0) -> None:
         """Permanently stop touching one KV-backed bank in this process."""
@@ -1748,8 +1963,14 @@ class CachedWeightProvider:
         bank = self._borrowed_banks[bank_index]
         if not bank.enabled:
             return
+        gpu_cache = self._gpu_resident_cache
+        if bank_index == 0 and gpu_cache is not None and gpu_cache.victim_capacity:
+            if gpu_cache.device_authoritative:
+                self._download_gpu_cache_state()
+            gpu_cache.detach_victim_tensors()
         bank.enabled = False
         bank.slots.clear()
+        bank.lfru.clear()
         bank.free_slots.clear()
 
     def _plan_one_borrowed_group(
@@ -1770,6 +1991,7 @@ class CachedWeightProvider:
             for expert_id in list(bank.slots):
                 if expert_id in self._lru:
                     bank.free_slots.append(bank.slots.pop(expert_id))
+                    bank.lfru.pop(expert_id, None)
 
         used = set(valid_unique_ids)
         group = [
@@ -1800,6 +2022,14 @@ class CachedWeightProvider:
         excluded_ids: set[int] | None = None,
     ) -> list[tuple[int, list[int]]]:
         """Choose disjoint expert groups for every still-active KV tier."""
+        # A decode-victim bank is storage, not a second execution cache.  In
+        # particular, do not populate it during prefill: breakable CUDA-graph
+        # retries may re-enter this planner/executor after mutating the bank,
+        # while the protected group was computed from the state before that
+        # mutation.  Decode fills the initially empty bank naturally as
+        # primary residents are evicted, and continues to use one MoE launch.
+        if self._decode_victim_enabled:
+            return []
         valid_unique_ids = [
             expert_id for expert_id in unique_ids if 0 <= expert_id < self._num_experts
         ]
@@ -1818,7 +2048,7 @@ class CachedWeightProvider:
         self, topk_ids: torch.Tensor, unique_ids: list[int]
     ) -> list[int]:
         """Compatibility helper returning the most durable bank's group."""
-        if not self._borrowed_banks:
+        if not self._borrowed_banks or self._decode_victim_enabled:
             return []
         valid_unique_ids = [
             expert_id for expert_id in unique_ids if 0 <= expert_id < self._num_experts
@@ -1842,13 +2072,31 @@ class CachedWeightProvider:
         copy_stream = current_platform.current_stream(bank.w13.device)
         self._wait_for_exclusive_host_updates(copy_stream)
         scale_copies: list[tuple[int, int]] = []
+        needed = set(expert_ids)
         for expert_id in expert_ids:
             if expert_id in bank.slots:
+                self._clock += 1
+                stats = bank.lfru[expert_id]
+                stats[0] += 1
+                stats[1] = self._clock
                 continue
-            if not bank.free_slots:
-                raise RuntimeError("borrowed expert bank has no free slot")
-            slot = bank.free_slots.pop()
+            if bank.free_slots:
+                slot = bank.free_slots.pop()
+            else:
+                victim_id = self._lowest_lfru_key(
+                    bank.lfru,
+                    self._clock,
+                    needed,
+                )
+                if victim_id is None:
+                    raise RuntimeError(
+                        "borrowed expert bank cannot replace a protected group"
+                    )
+                slot = bank.slots.pop(victim_id)
+                bank.lfru.pop(victim_id)
             bank.slots[expert_id] = slot
+            self._clock += 1
+            bank.lfru[expert_id] = [1, self._clock]
             bank.w13[slot].copy_(
                 self._cpu_expert_row(self._cpu_w13, expert_id),
                 non_blocking=True,
@@ -1910,6 +2158,78 @@ class CachedWeightProvider:
     @property
     def async_staging_enabled(self) -> bool:
         return self._staging_pool is not None
+
+    @property
+    def async_expert_map_enabled(self) -> bool:
+        return self._async_expert_map
+
+    @property
+    def gpu_resident_cache_enabled(self) -> bool:
+        return self._gpu_resident_cache is not None
+
+    @property
+    def gpu_resident_max_tokens(self) -> int:
+        return self._gpu_resident_max_tokens
+
+    def _gpu_victim_lru(self) -> dict[int, list[int]]:
+        gpu_cache = self._gpu_resident_cache
+        bank = self._base_borrowed_bank()
+        if (
+            gpu_cache is None
+            or not gpu_cache.victim_capacity
+            or bank is None
+            or not bank.enabled
+        ):
+            return {}
+
+        # A short host-planned decode may admit an expert which a preceding
+        # prefill left in the borrowed bank.  Both copies contain the same
+        # weights, but the primary LRU is authoritative once that admission
+        # completes.  Retire the redundant victim metadata at the host/device
+        # ownership boundary so the device planner starts from disjoint tiers.
+        # The physical victim row can remain stale until the slot is reused.
+        redundant = sorted(set(self._lru).intersection(bank.slots))
+        for expert in redundant:
+            slot = bank.slots.pop(expert)
+            bank.lfru.pop(expert, None)
+            if slot not in bank.free_slots:
+                bank.free_slots.append(slot)
+        if redundant:
+            logger.debug(
+                "Retired %d redundant GPU victim resident(s) for %s",
+                len(redundant),
+                self.name,
+            )
+        return {
+            expert: [slot, *bank.lfru[expert]] for expert, slot in bank.slots.items()
+        }
+
+    def _download_gpu_cache_state(self) -> None:
+        gpu_cache = self._gpu_resident_cache
+        if gpu_cache is None or not gpu_cache.device_authoritative:
+            return
+        self._lru, self._clock, self._free_slots = gpu_cache.download_state()
+        if not gpu_cache.victim_capacity:
+            return
+        bank = self._base_borrowed_bank()
+        if bank is None or not bank.enabled:
+            raise RuntimeError("GPU victim state has no active borrowed bank")
+        victim_lru, victim_free_slots = gpu_cache.downloaded_victim_state()
+        bank.slots = {expert: entry[0] for expert, entry in victim_lru.items()}
+        bank.lfru = {expert: entry[1:] for expert, entry in victim_lru.items()}
+        bank.free_slots = victim_free_slots
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def acquire_host_cache_state(self) -> None:
+        """Transfer cache-policy ownership before CPU-side planning.
+
+        A larger route can follow GPU-planned decode calls. Every host planner
+        must see the device-authoritative primary and victim metadata, so move
+        ownership before lookahead/borrowed/group planning rather than later
+        inside ``prepare()`` after those decisions were made.
+        """
+        self._download_gpu_cache_state()
 
     @property
     def async_staging_ready(self) -> bool:
@@ -2116,6 +2436,127 @@ class CachedWeightProvider:
             and len(self._bulk_prefill_groups) > 1
         )
 
+    def _decode_victim_bank(self, topk_ids: torch.Tensor) -> _BorrowedExpertBank | None:
+        if (
+            not self._decode_victim_enabled
+            or self.split != "expert"
+            or self._decode_victim_max_tokens == 0
+            or topk_ids.size(0) > self._decode_victim_max_tokens
+            or not self._borrowed_banks
+        ):
+            return None
+        bank = self._borrowed_banks[0]
+        return bank if bank.enabled else None
+
+    @staticmethod
+    def _lowest_lfru_key(
+        entries: dict[int, list[int]], clock: int, protected: set[int]
+    ) -> int | None:
+        best_key = None
+        best_score = float("inf")
+        for expert_id, entry in entries.items():
+            if expert_id in protected:
+                continue
+            freq, last = entry[-2:]
+            score = freq / (clock - last + 1)
+            if score < best_score:
+                best_score = score
+                best_key = expert_id
+        return best_key
+
+    def _decode_victim_gpu_tensors(self) -> list[torch.Tensor]:
+        tensors = [self._buf_w13, self._buf_w2]
+        if self._buf_w13_scale is not None:
+            assert self._buf_w2_scale is not None
+            tensors.extend([self._buf_w13_scale, self._buf_w2_scale])
+        return tensors
+
+    def _decode_victim_cpu_tensors(self) -> list[torch.Tensor]:
+        tensors = [self._cpu_w13, self._cpu_w2]
+        if self._buf_w13_scale is not None:
+            assert self._cpu_w13_scale is not None
+            assert self._cpu_w2_scale is not None
+            tensors.extend([self._cpu_w13_scale, self._cpu_w2_scale])
+        return tensors
+
+    @staticmethod
+    def _decode_victim_bank_tensors(bank: _BorrowedExpertBank) -> list[torch.Tensor]:
+        tensors = [bank.w13, bank.w2]
+        if bank.w13_scale is not None:
+            assert bank.w2_scale is not None
+            tensors.extend([bank.w13_scale, bank.w2_scale])
+        return tensors
+
+    @staticmethod
+    def _decode_victim_copy_op(
+        destination: torch.Tensor,
+        destination_slot: int,
+        source: torch.Tensor,
+        source_slot: int,
+    ) -> tuple[int, int, int]:
+        if not destination[0].is_contiguous() or not source[0].is_contiguous():
+            raise RuntimeError("decode victim copies require contiguous expert rows")
+        copy_bytes = source[0].numel() * source.element_size()
+        if destination[0].numel() * destination.element_size() != copy_bytes:
+            raise RuntimeError("decode victim source and destination rows differ")
+        destination_stride = destination.stride(0) * destination.element_size()
+        source_stride = source.stride(0) * source.element_size()
+        return (
+            destination.data_ptr() + destination_slot * destination_stride,
+            source.data_ptr() + source_slot * source_stride,
+            copy_bytes,
+        )
+
+    def _queue_decode_victim_copies(
+        self,
+        copies: list[tuple[int, int, int]],
+        *,
+        used_scratch: bool,
+    ) -> None:
+        if not copies:
+            return
+        function = self._decode_victim_copy_function
+        destinations = self._decode_victim_destinations
+        sources = self._decode_victim_sources
+        sizes = self._decode_victim_sizes
+        scratch = self._decode_victim_scratch
+        if (
+            function is None
+            or destinations is None
+            or sources is None
+            or sizes is None
+            or scratch is None
+        ):
+            raise RuntimeError("decode victim native-copy path is unavailable")
+        if len(copies) > len(destinations):
+            raise RuntimeError("decode victim copy wave exceeds its bounded arrays")
+
+        stream = current_platform.current_stream(self._buf_w13.device)
+        if used_scratch and scratch.used:
+            stream.wait_event(scratch.ready)
+        for index, (destination, source, copy_bytes) in enumerate(copies):
+            destinations[index] = destination
+            sources[index] = source
+            sizes[index] = copy_bytes
+
+        device_index = self._buf_w13.device.index
+        assert device_index is not None
+        error = function(
+            destinations,
+            sources,
+            sizes,
+            len(copies),
+            stream.cuda_stream,
+            device_index,
+        )
+        if error != 0:
+            raise RuntimeError(
+                f"ordered decode victim copy wave failed with CUDA error {error}"
+            )
+        if used_scratch:
+            scratch.ready.record(stream)
+            scratch.used = True
+
     def _record_prepare_stats(self, hits: int, misses: int) -> None:
         self.hits += hits
         self.misses += misses
@@ -2130,6 +2571,47 @@ class CachedWeightProvider:
                     self.misses,
                     100.0 * self.hits / total,
                 )
+                if self._decode_victim_enabled:
+                    logger.info(
+                        "Decode victim cache %s: %d promotions, %d stashes",
+                        self.name,
+                        self.decode_victim_hits,
+                        self.decode_victim_stashes,
+                    )
+
+    def _record_cache_trace(
+        self,
+        topk_ids: torch.Tensor,
+        unique_ids: list[int],
+        primary_before: list[int],
+        misses: list[int],
+        borrowed_before: list[dict[str, object]],
+        victim_hits: list[int],
+    ) -> None:
+        trace_file = self._cache_trace_file
+        if (
+            trace_file is None
+            or topk_ids.size(0) > self._cache_trace_max_tokens
+            or (
+                self._cache_trace_arm_file
+                and not os.path.exists(self._cache_trace_arm_file)
+            )
+        ):
+            return
+        record = {
+            "call": self._cache_trace_call_index,
+            "tokens": topk_ids.size(0),
+            "unique_ids": unique_ids,
+            "primary_before": primary_before,
+            "misses": misses,
+            "victim_hits": victim_hits,
+            "primary_after": sorted(self._lru),
+            "borrowed_before": borrowed_before,
+        }
+        trace_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._cache_trace_call_index += 1
+        if self._cache_trace_call_index % 64 == 0:
+            trace_file.flush()
 
     def _copy_experts_batched(self, misses: list[tuple[int, int]]) -> None:
         """Submit all weight and scale misses as one CUDA batch."""
@@ -2179,7 +2661,17 @@ class CachedWeightProvider:
         sizes_array = (ctypes.c_size_t * count)(*sizes)
 
         compute_stream = torch.cuda.current_stream(device=self._buf_w13.device)
-        copy_stream.wait_stream(compute_stream)
+        # The routed-expert kernel consumes these slots immediately, so a
+        # side stream cannot overlap useful work: it only adds compute->copy
+        # and copy->compute event dependencies. Submit on vLLM's non-default
+        # execution stream to preserve order with one batch call. CUDA rejects
+        # cudaMemcpyBatchAsync on the legacy NULL stream, so retain the
+        # dedicated stream only as a compatibility fallback.
+        submit_stream = compute_stream
+        using_fallback_stream = compute_stream.cuda_stream == 0
+        if using_fallback_stream:
+            copy_stream.wait_stream(compute_stream)
+            submit_stream = copy_stream
         device_index = self._buf_w13.device.index
         assert device_index is not None
         error = function(
@@ -2187,13 +2679,14 @@ class CachedWeightProvider:
             sources_array,
             sizes_array,
             count,
-            copy_stream.cuda_stream,
+            submit_stream.cuda_stream,
             device_index,
         )
         if error != 0:
             raise RuntimeError(f"cudaMemcpyBatchAsync failed with CUDA error {error}")
-        ready.record(copy_stream)
-        compute_stream.wait_event(ready)
+        if using_fallback_stream:
+            ready.record(copy_stream)
+            compute_stream.wait_event(ready)
 
     @eager_break_during_capture
     @torch.compiler.disable
@@ -2563,7 +3056,11 @@ class CachedWeightProvider:
     @eager_break_during_capture
     @torch.compiler.disable
     def prepare(
-        self, topk_ids: torch.Tensor, unique_ids: list[int] | None = None
+        self,
+        topk_ids: torch.Tensor,
+        unique_ids: list[int] | None = None,
+        *,
+        non_blocking_mapping: bool = False,
     ) -> ExpertWeightResult:
         """Make a set of experts resident and return the map selecting them.
 
@@ -2574,6 +3071,9 @@ class CachedWeightProvider:
                 know this, and passing it avoids a device synchronization --
                 which matters, because a split forward calls this once per
                 piece.
+            non_blocking_mapping: Enqueue the pinned-host expert map without
+                synchronizing the stream. This is safe only when the caller
+                runs one group before this provider can be prepared again.
 
         Returns:
             ExpertWeightResult holding the GPU buffers and an ``expert_map``
@@ -2582,6 +3082,10 @@ class CachedWeightProvider:
         Raises:
             RuntimeError: if more experts are requested than the cache holds.
         """
+        gpu_cache = self._gpu_resident_cache
+        if gpu_cache is not None and gpu_cache.device_authoritative:
+            self._download_gpu_cache_state()
+
         if unique_ids is None:
             unique_ids = topk_ids.unique().tolist()
         unique_ids = [
@@ -2594,6 +3098,23 @@ class CachedWeightProvider:
                 f"Set --moe-expert-cache-size >= {len(unique_ids)}."
             )
 
+        tracing = (
+            self._cache_trace_file is not None
+            and topk_ids.size(0) <= self._cache_trace_max_tokens
+        )
+        primary_before = sorted(self._lru) if tracing else []
+        borrowed_before = (
+            [
+                {
+                    "capacity": bank.capacity,
+                    "enabled": bank.enabled,
+                    "residents": sorted(bank.slots),
+                }
+                for bank in self._borrowed_banks
+            ]
+            if tracing
+            else []
+        )
         # Experts requested here must never be evicted to make room for
         # another one in the same call -- their slot would be handed to a
         # different expert while they are still expected to be resident. A
@@ -2604,6 +3125,44 @@ class CachedWeightProvider:
         needed = set(unique_ids)
 
         misses_to_copy: list[tuple[int, int]] = []
+        host_miss_ids: list[int] = []
+        victim_hit_ids: list[int] = []
+        decode_victim_bank = self._decode_victim_bank(topk_ids)
+        decode_victim_copies: list[tuple[int, int, int]] = []
+        decode_victim_used_scratch = False
+        primary_tensors = (
+            self._decode_victim_gpu_tensors() if decode_victim_bank is not None else []
+        )
+        bank_tensors = (
+            self._decode_victim_bank_tensors(decode_victim_bank)
+            if decode_victim_bank is not None
+            else []
+        )
+        scratch_tensors = (
+            self._decode_victim_scratch.tensors
+            if decode_victim_bank is not None
+            and self._decode_victim_scratch is not None
+            else []
+        )
+
+        def append_row_copies(
+            destinations: list[torch.Tensor],
+            destination_slot: int,
+            sources: list[torch.Tensor],
+            source_slot: int,
+        ) -> None:
+            if len(destinations) != len(sources):
+                raise RuntimeError("decode victim tensor groups differ")
+            decode_victim_copies.extend(
+                self._decode_victim_copy_op(
+                    destination,
+                    destination_slot,
+                    source,
+                    source_slot,
+                )
+                for destination, source in zip(destinations, sources)
+            )
+
         exclusive_swaps: list[tuple[int, int, int, int]] = []
         exclusive_scale_copies: list[tuple[int, int]] = []
         for expert_id in unique_ids:
@@ -2616,6 +3175,8 @@ class CachedWeightProvider:
                 self.hits += 1
             else:
                 # Cache miss: need to load expert
+                victim_id: int | None = None
+                victim_entry: list[int] | None = None
                 if self._free_slots:
                     if self.exclusive:
                         raise RuntimeError(
@@ -2639,7 +3200,8 @@ class CachedWeightProvider:
                     # is full and a miss remains to be served.
                     assert best_key is not None
                     victim_id = best_key
-                    victim_slot = self._lru.pop(best_key)[0]
+                    victim_entry = self._lru.pop(best_key)
+                    victim_slot = victim_entry[0]
                     if self.exclusive:
                         slot, swap = self._plan_exclusive_swap(
                             expert_id, victim_id, victim_slot
@@ -2650,9 +3212,90 @@ class CachedWeightProvider:
                     else:
                         slot = victim_slot
 
+                if (
+                    decode_victim_bank is not None
+                    and expert_id in decode_victim_bank.slots
+                ):
+                    bank_slot = decode_victim_bank.slots.pop(expert_id)
+                    bank_stats = decode_victim_bank.lfru.pop(expert_id)
+                    if victim_id is None or victim_entry is None:
+                        append_row_copies(
+                            primary_tensors,
+                            slot,
+                            bank_tensors,
+                            bank_slot,
+                        )
+                        decode_victim_bank.free_slots.append(bank_slot)
+                    else:
+                        assert scratch_tensors
+                        append_row_copies(
+                            scratch_tensors,
+                            0,
+                            bank_tensors,
+                            bank_slot,
+                        )
+                        append_row_copies(
+                            bank_tensors,
+                            bank_slot,
+                            primary_tensors,
+                            victim_entry[0],
+                        )
+                        append_row_copies(
+                            primary_tensors,
+                            victim_entry[0],
+                            scratch_tensors,
+                            0,
+                        )
+                        decode_victim_bank.slots[victim_id] = bank_slot
+                        decode_victim_bank.lfru[victim_id] = victim_entry[1:]
+                        self.decode_victim_stashes += 1
+                        decode_victim_used_scratch = True
+
+                    self._clock += 1
+                    self._lru[expert_id] = [
+                        slot,
+                        bank_stats[0] + 1,
+                        self._clock,
+                    ]
+                    self.hits += 1
+                    self.decode_victim_hits += 1
+                    victim_hit_ids.append(expert_id)
+                    continue
+
+                if (
+                    decode_victim_bank is not None
+                    and victim_id is not None
+                    and victim_entry is not None
+                ):
+                    stash_slot: int | None
+                    if decode_victim_bank.free_slots:
+                        stash_slot = decode_victim_bank.free_slots.pop()
+                    else:
+                        bank_victim = self._lowest_lfru_key(
+                            decode_victim_bank.lfru,
+                            self._clock,
+                            needed,
+                        )
+                        if bank_victim is None:
+                            stash_slot = None
+                        else:
+                            stash_slot = decode_victim_bank.slots.pop(bank_victim)
+                            decode_victim_bank.lfru.pop(bank_victim)
+                    if stash_slot is not None:
+                        append_row_copies(
+                            bank_tensors,
+                            stash_slot,
+                            primary_tensors,
+                            victim_entry[0],
+                        )
+                        decode_victim_bank.slots[victim_id] = stash_slot
+                        decode_victim_bank.lfru[victim_id] = victim_entry[1:]
+                        self.decode_victim_stashes += 1
+
                 self._clock += 1
                 self._lru[expert_id] = [slot, 1, self._clock]
                 self.misses += 1
+                host_miss_ids.append(expert_id)
                 if not self.exclusive:
                     misses_to_copy.append((slot, expert_id))
 
@@ -2662,6 +3305,12 @@ class CachedWeightProvider:
         if self._mapped_scales:
             result_w13_scale, result_w2_scale, mapped_scale_bank = (
                 self._prepare_mapped_scale_bank(unique_ids)
+            )
+
+        if decode_victim_copies:
+            self._queue_decode_victim_copies(
+                decode_victim_copies,
+                used_scratch=decode_victim_used_scratch,
             )
 
         if exclusive_swaps:
@@ -2726,13 +3375,27 @@ class CachedWeightProvider:
         # counters immediately; only advance/log the prepare-call interval.
         self._record_prepare_stats(hits=0, misses=0)
 
-        # Expose exactly this group. Blocking on purpose: the host mirror is
-        # rewritten by the next group, so an async copy could still be reading
-        # it when that happens.
+        # Expose exactly this group. Multi-group execution must block because
+        # it rewrites the same host mirror immediately. On a one-group path the
+        # consuming MoE kernel is enqueued next on this stream, and this
+        # layer-private mirror cannot be reused until a later model step, so a
+        # pinned asynchronous copy safely removes a per-layer host barrier.
         self._mapping_host.fill_(-1)
         for expert_id in unique_ids:
             self._mapping_host[expert_id] = self._lru[expert_id][0]
-        self._mapping.copy_(self._mapping_host)
+        self._mapping.copy_(
+            self._mapping_host,
+            non_blocking=non_blocking_mapping,
+        )
+
+        self._record_cache_trace(
+            topk_ids,
+            unique_ids,
+            primary_before,
+            host_miss_ids,
+            borrowed_before,
+            victim_hit_ids,
+        )
 
         return ExpertWeightResult(
             w1=self._buf_w13,
@@ -2741,6 +3404,28 @@ class CachedWeightProvider:
             w1_scale=result_w13_scale,
             w2_scale=result_w2_scale,
             mapped_scale_bank=mapped_scale_bank,
+        )
+
+    @eager_break_during_capture
+    @torch.compiler.disable
+    def prepare_gpu_resident(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
+        """Prepare a small route without making its ids visible to the host."""
+        gpu_cache = self._gpu_resident_cache
+        if gpu_cache is None:
+            raise RuntimeError("GPU-resident expert caching is not enabled")
+        if not gpu_cache.device_authoritative:
+            gpu_cache.upload_state(
+                self._lru,
+                self._clock,
+                self._gpu_victim_lru(),
+            )
+        expert_map = gpu_cache.prepare(topk_ids)
+        return ExpertWeightResult(
+            w1=self._buf_w13,
+            w2=self._buf_w2,
+            expert_map=expert_map,
+            w1_scale=self._buf_w13_scale,
+            w2_scale=self._buf_w2_scale,
         )
 
 
@@ -2790,9 +3475,52 @@ def run_with_expert_cache(
     # segment. This covers the captured decode sizes (1 and 2) without freezing
     # their expert ids into the graph.
     if topk_ids.numel() <= provider.capacity:
+        if provider.gpu_resident_cache_enabled:
+            return finish_forward(
+                run_and_release(
+                    provider.prepare_gpu_resident(topk_ids),
+                    _ALL_ROWS,
+                    True,
+                )
+            )
         return finish_forward(
-            run_and_release(provider.prepare(topk_ids), _ALL_ROWS, True)
+            run_and_release(
+                provider.prepare(
+                    topk_ids,
+                    non_blocking_mapping=provider.async_expert_map_enabled,
+                ),
+                _ALL_ROWS,
+                True,
+            )
         )
+
+    # Padded DSpark routes can exceed the fixed planner buffer even though a
+    # bounded number of complete token rows fits at a time. Preserve every
+    # token's full routed set, execute row slices in stream order, and include
+    # shared experts for every disjoint output slice. This removes the host-
+    # visible unique()/tolist() planner from small multi-request decode while
+    # keeping GpuResidentExpertCache.prepare()'s hard capacity invariant.
+    if provider.gpu_resident_cache_enabled:
+        top_k = topk_ids.size(1)
+        max_tokens = provider.gpu_resident_max_tokens
+        if 0 < top_k <= provider.capacity and topk_ids.size(0) <= max_tokens:
+            rows_per_chunk = provider.capacity // top_k
+            outputs: list[torch.Tensor] = []
+            for start in range(0, topk_ids.size(0), rows_per_chunk):
+                rows = slice(start, min(start + rows_per_chunk, topk_ids.size(0)))
+                outputs.append(
+                    run_and_release(
+                        provider.prepare_gpu_resident(topk_ids[rows]),
+                        rows,
+                        True,
+                    )
+                )
+            return finish_forward(torch.cat(outputs, dim=0))
+
+        # The CPU planners below inspect the primary LFRU, lookahead state,
+        # and borrowed/victim banks before prepare() is called. Download the
+        # device state now so none of those decisions sees a stale host mirror.
+        provider.acquire_host_cache_state()
 
     if provider.split == "expert":
         unique_ids = topk_ids.unique().tolist()
@@ -2824,7 +3552,11 @@ def run_with_expert_cache(
         if not borrowed_groups and lookahead is None and len(groups) == 1:
             return finish_forward(
                 run_and_release(
-                    provider.prepare(topk_ids, groups[0]),
+                    provider.prepare(
+                        topk_ids,
+                        groups[0],
+                        non_blocking_mapping=provider.async_expert_map_enabled,
+                    ),
                     _ALL_ROWS,
                     True,
                 )
@@ -2844,7 +3576,11 @@ def run_with_expert_cache(
         prestaged_result: ExpertWeightResult | None = None
         if async_staging_ready and not bulk_prefill:
             for i, (kind, _, expert_ids) in enumerate(execution_groups):
-                if kind == "primary" and not provider.group_is_resident(expert_ids):
+                if (
+                    kind == "primary"
+                    and len(expert_ids) <= provider._staging_capacity
+                    and not provider.group_is_resident(expert_ids)
+                ):
                     prestaged_execution_index = i
                     prestaged_result = provider.prepare_staged_group(
                         expert_ids,
@@ -2860,7 +3596,12 @@ def run_with_expert_cache(
         staged_group_index = 0
         for i, (kind, borrowed_bank, expert_ids) in enumerate(execution_groups):
             resident = kind != "primary" or provider.group_is_resident(expert_ids)
-            staged = async_staging_ready and not bulk_prefill and not resident
+            staged = (
+                async_staging_ready
+                and not bulk_prefill
+                and not resident
+                and len(expert_ids) <= provider._staging_capacity
+            )
             result = (
                 provider.prepare_borrowed_group(expert_ids, borrowed_bank)
                 if kind == "borrowed" and borrowed_bank is not None
@@ -2908,7 +3649,15 @@ def run_with_expert_cache(
     if len(plan) == 1:
         rows, unique_ids = plan[0]
         return finish_forward(
-            run_and_release(provider.prepare(topk_ids, unique_ids), rows, True)
+            run_and_release(
+                provider.prepare(
+                    topk_ids,
+                    unique_ids,
+                    non_blocking_mapping=provider.async_expert_map_enabled,
+                ),
+                rows,
+                True,
+            )
         )
     return finish_forward(
         torch.cat(

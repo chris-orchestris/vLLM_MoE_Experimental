@@ -241,6 +241,8 @@ def _moe_forward_shared_out(
 ) -> None:
     """Breakable-graph shared MoE entry with stable caller-owned outputs."""
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if layer.shared_experts is not None:
+        layer.shared_experts.discard_orphaned_output()
     result = layer._forward_impl(
         hidden_states,
         router_logits,

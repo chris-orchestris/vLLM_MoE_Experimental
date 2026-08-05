@@ -152,6 +152,25 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def discard_orphaned_output(self) -> bool:
+        """Clear an output left by an aborted breakable-graph invocation.
+
+        Caller-owned-output custom ops copy and consume the shared tensor
+        before returning. Model execution is serial within each DBO slot, so
+        an occupied slot at the boundary of a new invocation cannot still be
+        live. Keep the forward assertion strict; only that explicit boundary
+        may recover capture/retry state.
+        """
+        output_idx = self._output_idx
+        if self._output[output_idx] is None:
+            return False
+        self._output[output_idx] = None
+        logger.warning_once(
+            "Discarded an orphaned shared-expert output at a breakable-graph "
+            "retry boundary."
+        )
+        return True
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,

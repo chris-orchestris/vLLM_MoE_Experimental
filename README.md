@@ -25,8 +25,17 @@ keeps active experts resident and asynchronously stages cache misses.
   with a lossless packed scale mirror.
 - DeepSeek V4 DSpark MTP speculative decoding with five speculative tokens.
 - Piecewise CUDA graph support around the dynamic expert-cache path.
-- Experimental adaptive KV-tail lending and host-staged TP all-reduce paths.
-  These advanced paths are deliberately not enabled in the basic recipes below.
+- A GPU-resident expert-cache planner that keeps LFRU policy state on the device
+  and gathers misses directly from mapped host memory, removing the per-step
+  host route synchronization from small decode batches.
+- Optional write-combined host backing for those mapped expert reads.
+- An optional copy-only victim tier that reuses the borrowed KV-tail bank, so a
+  recently evicted expert returns over NVLink-free device copies instead of PCIe.
+- Optional uneven tensor-parallel MoE intermediate partitions, for hosts whose
+  per-GPU host links are not symmetric. The final all-reduce is unchanged, so
+  the model result is exact.
+- Adaptive KV-tail lending and host-staged TP all-reduce paths. The measured
+  4-GPU recipe below enables both.
 
 ## Tested scope
 
@@ -61,9 +70,8 @@ source .venv/bin/activate
 ```
 
 The installer overlays this checkout on the precompiled CUDA 13 nightly and
-builds the small native expert-cache helper automatically. The optional native
-host-all-reduce helpers under `csrc/host_all_reduce/` are not required by these
-quick-start profiles.
+builds the native expert-cache, mapped-memory, and host-all-reduce helpers used
+by the optimized recipe below.
 
 ## Common launch settings
 
@@ -85,11 +93,47 @@ export VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH=1
 export VLLM_MOE_EXPERT_CACHE_INTERLAYER_PREFETCH_MIN_TOKENS=512
 ```
 
-### 4x RTX 3090 + CPU RAM
+### Optimal 4x RTX 3090 + CPU RAM
+
+This is the fully enabled configuration used for the measurements below. It
+assumes 56 or more physical CPU cores; the 14 all-reduce threads per rank use
+56 cores in total.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export VLLM_MARLIN_USE_ATOMIC_ADD=1
+export VLLM_MOE_ASYNC_EXPERT_MAP=0
+
+export NCCL_ALGO=Ring
+export NCCL_PROTO=LL,Simple
+export NCCL_MIN_NCHANNELS=1
+export NCCL_MAX_NCHANNELS=1
+
+export VLLM_HOST_ALLREDUCE=1
+export VLLM_HOST_ALLREDUCE_MIN_BYTES=8388608
+export VLLM_HOST_ALLREDUCE_MAX_BYTES=67108864
+export VLLM_HOST_ALLREDUCE_THREADS_PER_RANK=14
+export VLLM_HOST_ALLREDUCE_PIPELINE_CHUNKS=8
+export VLLM_HOST_ALLREDUCE_MAPPED_OUTPUT=1
+export VLLM_HOST_ALLREDUCE_LIBRARY="$PWD/vllm/distributed/device_communicators/host_barrier_pipeline_shim.so"
+export VLLM_HOST_ALLREDUCE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/distributed/device_communicators/mapped_host_tensor_ext.so"
+
 export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=32
+export VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE=1
+export VLLM_MOE_GPU_RESIDENT_MAX_TOKENS=24
+export VLLM_MOE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/model_executor/layers/fused_moe/mapped_host_tensor_typed_ext.so"
+export VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED=1
+
+export VLLM_MOE_KV_TAIL_CACHE_SIZE=8
+export VLLM_MOE_KV_TAIL_BURST_CACHE_SIZE=20
+export VLLM_MOE_KV_TAIL_CACHE_MIN_TOKENS=4096
+export VLLM_MOE_KV_TAIL_CACHE_LAYER_LIMIT=43
+export DSV4_MOE_KV_TAIL_CACHE_FENCE_BLOCK=2746
+export DSV4_MOE_KV_TAIL_BASE_FENCE_BLOCK=5614
+export DSV4_MOE_KV_TAIL_LOG_ALLOCATIONS=1
+export VLLM_MOE_KV_TAIL_DECODE_VICTIM=1
+export VLLM_MOE_KV_TAIL_DECODE_VICTIM_MAX_TOKENS=24
 
 vllm serve "$MODEL" \
   --served-model-name DeepSeek-V4-Flash-0731 \
@@ -102,7 +146,7 @@ vllm serve "$MODEL" \
   --tensor-parallel-size 4 \
   --distributed-executor-backend mp \
   --gpu-memory-utilization 0.98 \
-  --kv-cache-memory-bytes 6777995264 \
+  --kv-cache-memory 6777995264 \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --moe-expert-cache-size 48 \
@@ -121,11 +165,49 @@ vllm serve "$MODEL" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
-### 2x RTX 3090 + CPU RAM
+Measured steady-state resource use was 23,471-23,492 MiB (about 22.9 GiB) VRAM
+per GPU, about 169 GiB of system RAM used (roughly 40 GiB RSS per worker), and
+221,269 physical KV tokens before the tail is lent to the expert tiers. Use a
+256 GiB RAM host and allow about 160 GiB of disk for the checkpoint. On the
+five-GPU test host, physical GPUs `0,1,3,4` were selected for their topology;
+on a four-GPU machine, `0,1,2,3` is the normal choice.
+
+The fixed KV size and the two fence values form one tested layout. If another
+display load or driver footprint causes OOM, omit `--kv-cache-memory` and unset
+the six `KV_TAIL_CACHE`/`FENCE_BLOCK` variables plus the two `DECODE_VICTIM`
+variables. vLLM will then profile a smaller safe KV cache without borrowing its
+tail. Do not change only the fixed KV byte count while retaining these fences.
+
+### Optimal 2x RTX 3090 + CPU RAM
+
+This uses the same 56-core CPU budget as TP4: 28 all-reduce threads per rank.
+On the five-GPU test host, physical GPUs `0,3` were the best separate-root pair.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+export VLLM_MARLIN_USE_ATOMIC_ADD=1
+export VLLM_MOE_ASYNC_EXPERT_MAP=0
+
+export NCCL_ALGO=Ring
+export NCCL_PROTO=LL,Simple
+export NCCL_MIN_NCHANNELS=1
+export NCCL_MAX_NCHANNELS=1
+
+export VLLM_HOST_ALLREDUCE=1
+export VLLM_HOST_ALLREDUCE_MIN_BYTES=8388608
+export VLLM_HOST_ALLREDUCE_MAX_BYTES=67108864
+export VLLM_HOST_ALLREDUCE_THREADS_PER_RANK=28
+export VLLM_HOST_ALLREDUCE_PIPELINE_CHUNKS=8
+export VLLM_HOST_ALLREDUCE_MAPPED_OUTPUT=1
+export VLLM_HOST_ALLREDUCE_LIBRARY="$PWD/vllm/distributed/device_communicators/host_barrier_pipeline_shim.so"
+export VLLM_HOST_ALLREDUCE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/distributed/device_communicators/mapped_host_tensor_ext.so"
+
 export VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY=20
+export VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE=1
+export VLLM_MOE_GPU_RESIDENT_MAX_TOKENS=24
+export VLLM_MOE_MAPPED_TENSOR_LIBRARY="$PWD/vllm/model_executor/layers/fused_moe/mapped_host_tensor_typed_ext.so"
+export VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED=1
 
 vllm serve "$MODEL" \
   --served-model-name DeepSeek-V4-Flash-0731 \
@@ -138,7 +220,7 @@ vllm serve "$MODEL" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend mp \
   --gpu-memory-utilization 0.98 \
-  --kv-cache-memory-bytes 5100273664 \
+  --kv-cache-memory 5100273664 \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --moe-expert-cache-size 20 \
@@ -157,6 +239,13 @@ vllm serve "$MODEL" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
+Measured use was 23,269 MiB VRAM per GPU when idle and 23,951 MiB after the
+195.6K-token test, leaving 625 MiB free. System RAM use was about 165 GiB
+(roughly 78 GiB RSS per worker). The fixed 4.75 GiB KV allocation holds 246,034
+physical tokens. Use 256 GiB of RAM. If another GPU load causes OOM, omit
+`--kv-cache-memory` so vLLM profiles a safe value; keep the cache at 20 unless
+you specifically need more HBM margin.
+
 ### Optional lower-RAM mode
 
 The default cache keeps full CPU copies of GPU-resident experts for the fastest
@@ -169,11 +258,16 @@ and three-request aggregate throughput 572 tokens/s.
 There is no separate raw-exclusive variant: `--moe-expert-cache-exclusive`
 always enables both RAM-saving techniques.
 
-The installer already built the required native helper. Add only these flags to
-either launch recipe:
+This is a separate mode, not an add-on to the optimized mapped-expert path.
+Disable those incompatible settings before adding the two serve flags:
 
 ```bash
 mkdir -p /fast/local/nvme/vllm-exclusive-staging
+export VLLM_MOE_GPU_RESIDENT_EXPERT_CACHE=0
+export VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED=0
+export VLLM_MOE_KV_TAIL_DECODE_VICTIM=0
+unset VLLM_MOE_KV_TAIL_CACHE_SIZE VLLM_MOE_KV_TAIL_BURST_CACHE_SIZE
+unset DSV4_MOE_KV_TAIL_CACHE_FENCE_BLOCK DSV4_MOE_KV_TAIL_BASE_FENCE_BLOCK
 
 # Add to `vllm serve`:
 --moe-expert-cache-exclusive \
@@ -182,20 +276,42 @@ mkdir -p /fast/local/nvme/vllm-exclusive-staging
 
 Use fast local storage with roughly 140 GiB free for temporary startup staging.
 
+For an asymmetric host, give each rank an explicit MoE intermediate width. The
+widths must be positive multiples of 64 and sum to the model's intermediate
+size; expert parallelism is rejected:
+
+```bash
+export VLLM_MOE_TP_INTERMEDIATE_PARTITIONS=576,448,576,448
+```
+
+The TP2 fixed KV value is independent of the TP4 KV-tail fences because TP2
+does not borrow KV pages for experts.
+
+Expert-cache memory is the term that does move with topology. Each cached
+expert costs one full expert divided by the TP size, so halving TP doubles the
+per-rank cost of every slot: a slot is about 137 MiB at TP4 and about 274 MiB
+at TP2. Halving TP also doubles each rank's share of the dense weights, which
+on this model is roughly another 5 GiB per rank. That second effect, not the
+cache, is why the 2-GPU recipe uses a smaller cache and batch than the 4-GPU
+one. If you change TP or `--moe-expert-cache-size`, budget both.
+
 Both examples bind the OpenAI-compatible server to localhost. A single 200K
-request consumes most of the configured KV capacity, so the sequence limits are
+request consumes most of the available KV capacity, so the sequence limits are
 useful for ordinary workloads but do not imply several simultaneous 200K
 requests. First startup is slow because vLLM must load the checkpoint, allocate
 pinned expert storage, and compile/cache kernels.
 
 ## Reference performance
 
-On the tested 3090 host, the fully tuned TP4 profile reached roughly
-1,380-1,470 prompt tokens/s on a 5.8K-token prompt, 24-27 generation tokens/s,
-and about 491 prompt tokens/s at 195.6K tokens. The TP2 profile reached roughly
-890 prompt tokens/s and 12 generation tokens/s on the shorter workload, and
-about 432 prompt tokens/s at 195.6K tokens. These are development measurements,
-not guarantees; host memory bandwidth, CPU, drivers, and request shape matter.
+On the tested 3090 host, the recipe above prefills a cold 77.9K-token prompt at
+832.5 tokens/s and generates a 1,024-token continuation at 35.47 tokens/s.
+Aggregate output throughput was 25.25 tokens/s for two concurrent requests and
+24.22 tokens/s for three. TP2 reached 920.6 prompt tokens/s at 18.9K tokens,
+14.64 generation tokens/s on the short decode, 12.25 tokens/s for a 1,024-token
+continuation after a cached 77.9K prefix, and 13.41 aggregate output tokens/s
+for two concurrent requests. Its 195.6K-token prefill reached 433.7 tokens/s.
+These are development measurements, not guarantees; host memory bandwidth, CPU,
+drivers, and request shape matter.
 
 ---
 

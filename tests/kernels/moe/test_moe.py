@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    MarlinExperts,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
@@ -776,6 +777,31 @@ def marlin_moe_generate_valid_test_cases():
                 if is_valid(*args):
                     cases.append(args)
     return cases
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "topk"),
+    [
+        (37, 2048, 4096, 6),
+        (37, 512, 4096, 2),
+    ],
+)
+def test_marlin_workspace_shapes_track_peak_live_views(m, n, k, topk):
+    workspace1, workspace2, output = MarlinExperts.workspace_shapes(
+        None,
+        M=m,
+        N=n,
+        K=k,
+        topk=topk,
+        global_num_experts=256,
+        local_num_experts=256,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SILU,
+    )
+
+    assert workspace1 == (m, max(topk * n, k))
+    assert workspace2 == (m * topk * max(2 * n, k),)
+    assert output == (m, k)
 
 
 @dataclass

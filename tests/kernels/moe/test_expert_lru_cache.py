@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe import expert_weight_provider
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     _PACKED_SCALE_SCRATCH,
     CachedWeightProvider,
@@ -347,6 +348,138 @@ def test_borrowed_bank_is_one_way_disabled():
     assert provider.plan_borrowed_group(topk_ids, unique_ids) == []
 
 
+def test_full_borrowed_bank_replaces_only_an_unneeded_resident():
+    provider, w13, w2, _ = _make_provider(num_experts=8, capacity=4, split="expert")
+    _attach_borrowed_bank(provider, capacity=2)
+    provider.prepare_borrowed_group([0, 1])
+
+    result = provider.prepare_borrowed_group([1, 2])
+    torch.accelerator.synchronize()
+
+    assert set(provider._borrowed_slots) == {1, 2}
+    for expert_id in (1, 2):
+        slot = provider._borrowed_slots[expert_id]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+
+
+def test_batched_copy_uses_nondefault_compute_stream():
+    provider, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
+    submitted: dict[str, int] = {}
+
+    def submit_batch(*args) -> int:
+        submitted["count"] = args[3]
+        submitted["stream"] = args[4]
+        return 0
+
+    provider._batched_copy_function = submit_batch
+    provider._batched_copy_stream = torch.cuda.Stream()
+    provider._batched_copy_ready = torch.cuda.Event()
+    compute_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(compute_stream):
+        provider._copy_experts_batched([(0, 4), (1, 5)])
+
+    assert submitted["count"] == 4
+    assert submitted["stream"] == compute_stream.cuda_stream
+
+
+def test_decode_victim_promotes_and_preserves_evicted_weights_and_scales(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_MOE_KV_TAIL_DECODE_VICTIM", "1")
+    provider, w13, w2, scales = _make_provider(
+        num_experts=8,
+        capacity=4,
+        with_scales=True,
+        split="expert",
+    )
+    assert scales is not None
+    w13_scale, w2_scale = scales
+    _attach_borrowed_bank(provider, capacity=2, min_tokens=4)
+
+    provider.prepare(_topk([0, 1, 2, 3]))
+    provider.prepare_borrowed_group([4, 5])
+    initial_misses = provider.misses
+
+    # Expert 4 is promoted entirely on-device while expert 6 is a true H2D
+    # miss. Both displaced primary experts are retained in the victim bank.
+    result = provider.prepare(_topk([4, 6]), [4, 6])
+    torch.accelerator.synchronize()
+
+    assert provider.misses == initial_misses + 1
+    assert provider.decode_victim_hits == 1
+    assert provider.decode_victim_stashes == 2
+    assert set(provider._lru).isdisjoint(provider._borrowed_slots)
+    for expert_id in (4, 6):
+        slot = provider._lru[expert_id][0]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+        assert result.w1_scale is not None
+        assert result.w2_scale is not None
+        torch.testing.assert_close(result.w1_scale[slot].cpu(), w13_scale[expert_id])
+        torch.testing.assert_close(result.w2_scale[slot].cpu(), w2_scale[expert_id])
+
+    # A displaced expert must make the reverse trip without another host miss.
+    displaced_id = next(iter(provider._borrowed_slots))
+    misses_before_reverse = provider.misses
+    result = provider.prepare(_topk([displaced_id]), [displaced_id])
+    torch.accelerator.synchronize()
+    assert provider.misses == misses_before_reverse
+    assert provider.decode_victim_hits == 2
+    slot = provider._lru[displaced_id][0]
+    torch.testing.assert_close(result.w1[slot].cpu(), w13[displaced_id])
+    torch.testing.assert_close(result.w2[slot].cpu(), w2[displaced_id])
+
+
+def test_decode_victim_stops_using_a_revoked_bank(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_MOE_KV_TAIL_DECODE_VICTIM", "1")
+    provider, w13, w2, _ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+    )
+    _attach_borrowed_bank(provider, capacity=2, min_tokens=4)
+    provider.prepare(_topk([0, 1, 2, 3]))
+    provider.prepare_borrowed_group([4, 5])
+    provider.disable_borrowed_buffers()
+
+    misses_before = provider.misses
+    victim_hits_before = provider.decode_victim_hits
+    result = provider.prepare(_topk([4]), [4])
+    torch.accelerator.synchronize()
+
+    assert provider.misses == misses_before + 1
+    assert provider.decode_victim_hits == victim_hits_before
+    assert not provider._borrowed_slots
+    slot = provider._lru[4][0]
+    torch.testing.assert_close(result.w1[slot].cpu(), w13[4])
+    torch.testing.assert_close(result.w2[slot].cpu(), w2[4])
+
+
+def test_decode_victim_uses_borrowed_bank_only_as_storage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_MOE_KV_TAIL_DECODE_VICTIM", "1")
+    monkeypatch.setenv("VLLM_MOE_KV_TAIL_DECODE_VICTIM_MAX_TOKENS", "1")
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+    )
+    _attach_borrowed_bank(provider, capacity=2, min_tokens=1)
+
+    decode = _topk([0, 1, 2, 3, 4, 5])
+    assert provider.plan_borrowed_group(decode, decode.unique().tolist()) == []
+
+    prefill = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device="cuda")
+    assert provider.plan_borrowed_group(prefill, prefill.unique().tolist()) == []
+    assert provider.plan_borrowed_groups(prefill, prefill.unique().tolist()) == []
+    assert not provider._borrowed_slots
+
+
 def test_borrowed_tiers_are_disjoint_and_independently_disabled():
     provider, *_ = _make_provider(num_experts=8, capacity=3, split="expert")
     base_index = _attach_borrowed_bank(provider, capacity=2)
@@ -616,6 +749,47 @@ def test_cpu_backing_is_pinned():
     assert provider._cpu_w2.is_pinned()
 
 
+def test_write_combined_copy_replaces_cpu_source_storage(monkeypatch):
+    source = torch.arange(32, dtype=torch.uint8)
+    original_pointer = source.data_ptr()
+
+    monkeypatch.setattr(
+        expert_weight_provider,
+        "write_combined_host_empty",
+        lambda *shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+    result = expert_weight_provider._write_combined_cpu_copy(source)
+
+    assert result is source
+    assert source.data_ptr() != original_pointer
+    torch.testing.assert_close(source, torch.arange(32, dtype=torch.uint8))
+
+
+def test_write_combined_backing_is_used_for_weights_and_scales(monkeypatch):
+    calls = []
+
+    def fake_write_combined_copy(source):
+        calls.append(source)
+        return source.pin_memory()
+
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_WRITE_COMBINED", "1")
+    monkeypatch.setattr(
+        expert_weight_provider,
+        "_write_combined_cpu_copy",
+        fake_write_combined_copy,
+    )
+
+    provider, *_ = _make_provider(with_scales=True)
+
+    assert len(calls) == 4
+    assert provider._cpu_w13.is_pinned()
+    assert provider._cpu_w2.is_pinned()
+    assert provider._cpu_w13_scale is not None
+    assert provider._cpu_w13_scale.is_pinned()
+    assert provider._cpu_w2_scale is not None
+    assert provider._cpu_w2_scale.is_pinned()
+
+
 # -- Expert-group execution --
 
 
@@ -767,40 +941,6 @@ def test_async_staging_index_excludes_borrowed_and_resident_groups(monkeypatch):
     assert observed_indices == [0]
 
 
-def test_async_staging_launches_first_miss_before_resident_compute(monkeypatch):
-    """The first copy gets resident-kernel lead time before its event wait."""
-    provider, *_ = _make_provider(
-        num_experts=8,
-        capacity=2,
-        split="expert",
-        async_staging=True,
-    )
-    provider.prepare(_rows([[6, 7]]))
-    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
-    events: list[str] = []
-    original_prepare = provider.prepare_staged_group
-
-    def record_prepare(expert_ids, group_index, *, wait_for_ready=True):
-        events.append(f"stage:{group_index}:{wait_for_ready}")
-        return original_prepare(
-            expert_ids,
-            group_index,
-            wait_for_ready=wait_for_ready,
-        )
-
-    monkeypatch.setattr(provider, "prepare_staged_group", record_prepare)
-
-    def run(result, rows, include_shared):
-        events.append("run:resident" if result.w1 is provider.buf_w13 else "run:staged")
-        return torch.zeros(topk.size(0), 4, device="cuda")
-
-    run_with_expert_cache(provider, topk, run)
-
-    assert events[0] == "stage:0:False"
-    assert events[1] == "run:resident"
-    assert events[2] == "run:staged"
-
-
 def test_interlayer_prefetch_uses_third_shared_bank(monkeypatch):
     """A predecessor hides one predicted successor upload in a bounded bank."""
     monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
@@ -922,6 +1062,44 @@ def test_async_staging_survives_borrowed_bank_duplicate_invalidation():
         excluded_ids={0, 1},
     )
     assert groups == [[4, 5, 6], [2, 3, 7]]
+
+
+def test_oversized_retry_group_falls_back_to_primary_cache(monkeypatch):
+    """A replay-time residency change cannot overflow the smaller stage bank."""
+    monkeypatch.setenv("VLLM_MOE_EXPERT_CACHE_ASYNC_STAGING_CAPACITY", "2")
+    provider, *_ = _make_provider(
+        num_experts=8,
+        capacity=4,
+        split="expert",
+        async_staging=True,
+    )
+    _attach_borrowed_bank(provider, capacity=1)
+    provider.prepare(_rows([[4, 5], [6, 7]]))
+    topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+    original_resident = provider.group_is_resident
+
+    def replay_residency(expert_ids):
+        # Breakable-graph replay can observe cache state newer than the plan.
+        # Model that only for the four-expert resident group.
+        if len(expert_ids) > provider._staging_capacity:
+            return False
+        return original_resident(expert_ids)
+
+    monkeypatch.setattr(provider, "group_is_resident", replay_residency)
+    buffers: list[torch.Tensor] = []
+
+    def run(result, rows, include_shared):
+        buffers.append(result.w1)
+        return torch.zeros(topk.size(0), 4, device="cuda")
+
+    run_with_expert_cache(provider, topk, run)
+
+    assert any(buffer is provider.buf_w13 for buffer in buffers)
+    assert all(
+        buffer.size(0) <= provider._staging_capacity
+        for buffer in buffers
+        if buffer is not provider.buf_w13
+    )
 
 
 def test_bulk_prefill_uses_static_contiguous_groups(monkeypatch):
@@ -1114,6 +1292,53 @@ def test_group_execution_covers_every_pair():
     assert sorted(seen) == sorted(topk.unique().tolist())
     assert firsts[0] is True and not any(firsts[1:]), "first flag must fire once"
     assert out.shape == (topk.size(0), 4)
+
+
+def test_async_expert_map_is_used_only_for_single_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The pinned map can be asynchronous only when its mirror is not reused."""
+    monkeypatch.setenv("VLLM_MOE_ASYNC_EXPERT_MAP", "1")
+
+    single, *_ = _make_provider(num_experts=8, capacity=4, split="expert")
+    single_modes: list[bool] = []
+    single_prepare = single.prepare
+
+    def record_single(*args, **kwargs):
+        single_modes.append(kwargs.get("non_blocking_mapping", False))
+        return single_prepare(*args, **kwargs)
+
+    single.prepare = record_single
+    single_topk = _rows([[0, 1], [1, 2]])
+
+    def run_single(result, rows, include_shared):
+        assert include_shared
+        mapping = result.expert_map.tolist()
+        assert all(mapping[expert_id] >= 0 for expert_id in (0, 1, 2))
+        assert all(mapping[expert_id] == -1 for expert_id in range(3, 8))
+        return torch.zeros(single_topk[rows].size(0), 4, device="cuda")
+
+    run_with_expert_cache(single, single_topk, run_single)
+    assert single_modes == [True]
+
+    grouped, *_ = _make_provider(num_experts=8, capacity=3, split="expert")
+    grouped_modes: list[bool] = []
+    grouped_prepare = grouped.prepare
+
+    def record_grouped(*args, **kwargs):
+        grouped_modes.append(kwargs.get("non_blocking_mapping", False))
+        return grouped_prepare(*args, **kwargs)
+
+    grouped.prepare = record_grouped
+    grouped_topk = _rows([[0, 1], [2, 3], [4, 5], [6, 7]])
+
+    def run_grouped(result, rows, include_shared):
+        result.expert_map.tolist()
+        return torch.zeros(grouped_topk[rows].size(0), 4, device="cuda")
+
+    run_with_expert_cache(grouped, grouped_topk, run_grouped)
+    assert len(grouped_modes) > 1
+    assert not any(grouped_modes)
 
 
 # -- Token-split execution --

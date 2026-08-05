@@ -29,6 +29,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -159,11 +160,13 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
-        head_hidden = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
-        self._sample_sequential(num_reqs, head_hidden)
+        with record_function_or_nullcontext("dspark: backbone"):
+            head_hidden = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        with record_function_or_nullcontext("dspark: markov_sample"):
+            self._sample_sequential(num_reqs, head_hidden)

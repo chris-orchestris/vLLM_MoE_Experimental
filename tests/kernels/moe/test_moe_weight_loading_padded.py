@@ -9,10 +9,114 @@ have the original unpadded size. These tests verify that weight loading
 correctly handles this mismatch.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+
+def _make_uneven_tp_config(tp_rank: int) -> FusedMoEConfig:
+    parallel = replace(
+        FusedMoEParallelConfig.make_no_parallel(), tp_size=4, tp_rank=tp_rank
+    )
+    return FusedMoEConfig(
+        num_experts=256,
+        experts_per_token=8,
+        hidden_dim=4096,
+        intermediate_size=2048,
+        num_local_experts=256,
+        num_logical_experts=256,
+        activation=MoEActivation.SILU,
+        device="cuda",
+        routing_method=RoutingMethodType.DeepseekV4,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+
+
+class TestUnevenTpIntermediatePartitions:
+    def test_config_selects_rank_specific_width_and_start(self, monkeypatch):
+        monkeypatch.setenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", "640,640,384,384")
+        config = _make_uneven_tp_config(tp_rank=2)
+
+        assert config.tp_intermediate_partition_sizes == (640, 640, 384, 384)
+        assert config.tp_intermediate_partition_start == 1280
+        assert config.intermediate_size_per_partition == 384
+        assert config.intermediate_size_per_partition_unpadded == 384
+
+    @pytest.mark.parametrize(
+        ("tp_rank", "expected_start", "expected_width"),
+        [
+            (0, 0, 576),
+            (1, 576, 576),
+            (2, 1152, 448),
+            (3, 1600, 448),
+        ],
+    )
+    def test_config_accepts_64_aligned_topology_partitions(
+        self, monkeypatch, tp_rank, expected_start, expected_width
+    ):
+        monkeypatch.setenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", "576,576,448,448")
+        config = _make_uneven_tp_config(tp_rank=tp_rank)
+
+        assert config.tp_intermediate_partition_sizes == (576, 576, 448, 448)
+        assert config.tp_intermediate_partition_start == expected_start
+        assert config.intermediate_size_per_partition == expected_width
+        assert config.intermediate_size_per_partition_unpadded == expected_width
+
+    @pytest.mark.parametrize(
+        ("spec", "message"),
+        [
+            ("640,640,384", "one width per TP rank"),
+            ("640,640,512,384", "must sum"),
+            ("600,600,424,424", "multiples of 64"),
+        ],
+    )
+    def test_config_rejects_unsafe_partition_specs(self, monkeypatch, spec, message):
+        monkeypatch.setenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", spec)
+        with pytest.raises(ValueError, match=message):
+            _make_uneven_tp_config(tp_rank=0)
+
+    @pytest.mark.parametrize(
+        ("checkpoint_extent", "expected"),
+        [
+            (2048, (1280, 384)),
+            (1024, (640, 192)),
+            (64, (40, 12)),
+        ],
+    )
+    def test_packed_checkpoint_bounds_are_proportional(
+        self, monkeypatch, checkpoint_extent, expected
+    ):
+        monkeypatch.setenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", "640,640,384,384")
+        layer = object.__new__(RoutedExperts)
+        layer.moe_config = _make_uneven_tp_config(tp_rank=2)
+
+        assert layer._tp_intermediate_shard_bounds(checkpoint_extent, 2) == expected
+
+    def test_w13_and_packed_w2_load_the_same_logical_slice(self, monkeypatch):
+        monkeypatch.setenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", "640,640,384,384")
+        layer = object.__new__(RoutedExperts)
+        layer.moe_config = _make_uneven_tp_config(tp_rank=2)
+
+        full_w13 = torch.arange(2048 * 2, dtype=torch.float32).reshape(2048, 2)
+        local_w13 = torch.zeros(2 * 384, 2)
+        layer._load_w13(local_w13, 0, "w1", full_w13, tp_rank=2)
+        assert torch.equal(local_w13[:384], full_w13[1280:1664])
+        assert torch.count_nonzero(local_w13[384:]) == 0
+
+        full_w2_packed = torch.arange(2 * 1024, dtype=torch.float32).reshape(2, 1024)
+        local_w2_packed = torch.zeros(2, 192)
+        layer._load_w2(local_w2_packed, 1, full_w2_packed, tp_rank=2)
+        assert torch.equal(local_w2_packed, full_w2_packed[:, 640:832])
 
 
 class TestGetHiddenDim:

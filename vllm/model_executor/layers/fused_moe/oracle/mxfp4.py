@@ -648,10 +648,18 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
-        intermediate_size = round_up(intermediate_size, 128)
         if current_platform.is_xpu():
+            intermediate_size = round_up(intermediate_size, 128)
             hidden_size = round_up(hidden_size, 128)
         else:
+            # CUDA Marlin's two MoE GEMMs require gate-up ``2 * N`` to be a
+            # multiple of 128 and down-projection ``N`` to be a multiple of
+            # 64. Thus the rank-local intermediate extent only needs 64
+            # alignment. Keeping native 64-aligned extents is important for
+            # topology-aware uneven TP: rounding 576 or 448 to 128 alignment
+            # would silently change both the checkpoint slice and its transfer
+            # footprint.
+            intermediate_size = round_up(intermediate_size, 64)
             hidden_size = round_up(hidden_size, 256)
     elif backend in TRTLLM_BACKENDS:
         intermediate_size = round_up(intermediate_size, 128)

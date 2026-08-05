@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Union
 
@@ -1322,6 +1323,14 @@ class FusedMoEConfig:
 
     # Set by __post_init__
     intermediate_size_per_partition: int = -1
+    # Optional rank-specific TP widths. This is an experimental escape hatch for
+    # heterogeneous PCIe paths: ranks with faster host links can own a larger
+    # slice of every expert while the final TP all-reduce preserves the exact
+    # model result. The checkpoint still contains the global intermediate axis.
+    tp_intermediate_partition_sizes: tuple[int, ...] | None = field(
+        init=False, default=None
+    )
+    tp_intermediate_partition_start: int = field(init=False, default=0)
     rocm_aiter_fmoe_enabled: bool = False
     aiter_fmoe_shared_expert_enabled: bool = False
 
@@ -1329,8 +1338,59 @@ class FusedMoEConfig:
         from vllm._aiter_ops import rocm_aiter_ops
 
         tp_size = self.moe_parallel_config.tp_size
-        assert self.intermediate_size % tp_size == 0
-        self.intermediate_size_per_partition = self.intermediate_size // tp_size
+        partition_spec = os.getenv("VLLM_MOE_TP_INTERMEDIATE_PARTITIONS", "").strip()
+        if partition_spec:
+            if self.moe_parallel_config.use_ep:
+                raise ValueError(
+                    "VLLM_MOE_TP_INTERMEDIATE_PARTITIONS is incompatible with "
+                    "expert parallelism."
+                )
+            try:
+                partition_sizes = tuple(
+                    int(value.strip()) for value in partition_spec.split(",")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "VLLM_MOE_TP_INTERMEDIATE_PARTITIONS must be a "
+                    "comma-separated list of integer widths."
+                ) from exc
+            if len(partition_sizes) != tp_size:
+                raise ValueError(
+                    "VLLM_MOE_TP_INTERMEDIATE_PARTITIONS must contain one width "
+                    f"per TP rank ({tp_size}), got {len(partition_sizes)}."
+                )
+            if any(size <= 0 or size % 64 != 0 for size in partition_sizes):
+                raise ValueError(
+                    "VLLM_MOE_TP_INTERMEDIATE_PARTITIONS widths must be positive "
+                    "multiples of 64 for the experimental MXFP4 Marlin path."
+                )
+            if sum(partition_sizes) != self.intermediate_size:
+                raise ValueError(
+                    "VLLM_MOE_TP_INTERMEDIATE_PARTITIONS must sum to the global "
+                    f"MoE intermediate size ({self.intermediate_size}), got "
+                    f"{sum(partition_sizes)}."
+                )
+            tp_rank = self.moe_parallel_config.tp_rank
+            if not 0 <= tp_rank < tp_size:
+                raise ValueError(
+                    f"Invalid MoE TP rank {tp_rank} for TP size {tp_size}."
+                )
+            self.tp_intermediate_partition_sizes = partition_sizes
+            self.tp_intermediate_partition_start = sum(partition_sizes[:tp_rank])
+            self.intermediate_size_per_partition = partition_sizes[tp_rank]
+            logger.info_once(
+                "Using uneven MoE TP intermediate partitions %s; rank %d owns "
+                "[%d, %d).",
+                partition_sizes,
+                tp_rank,
+                self.tp_intermediate_partition_start,
+                self.tp_intermediate_partition_start
+                + self.intermediate_size_per_partition,
+                scope="local",
+            )
+        else:
+            assert self.intermediate_size % tp_size == 0
+            self.intermediate_size_per_partition = self.intermediate_size // tp_size
 
         if self.dp_size > 1:
             logger.debug_once(

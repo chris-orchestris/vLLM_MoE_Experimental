@@ -1560,6 +1560,23 @@ def test_mxfp4_emulation_rounds_up_to_block_size(
     assert rounded_intermediate % OCP_MX_BLOCK_SIZE == 0
 
 
+@pytest.mark.parametrize("intermediate_size", [448, 576])
+def test_mxfp4_marlin_preserves_64_aligned_intermediate_size(intermediate_size: int):
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        mxfp4_round_up_hidden_size_and_intermediate_size,
+    )
+
+    rounded_hidden, rounded_intermediate = (
+        mxfp4_round_up_hidden_size_and_intermediate_size(
+            Mxfp4MoeBackend.MARLIN, 4096, intermediate_size
+        )
+    )
+
+    assert rounded_hidden == 4096
+    assert rounded_intermediate == intermediate_size
+
+
 def test_select_mxfp4_moe_backend_raises_with_unsupported_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ):

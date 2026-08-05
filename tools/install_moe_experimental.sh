@@ -67,7 +67,11 @@ cuda_root="${cuda_roots[0]}"
 helper_dir="$repo_dir/vllm/model_executor/layers/fused_moe"
 helper_path="$helper_dir/cuda_expert_cache_helper.so"
 helper_tmp="$(mktemp "$helper_dir/.cuda_expert_cache_helper.XXXXXX.so")"
-trap 'rm -f "$helper_tmp"' EXIT
+communicator_dir="$repo_dir/vllm/distributed/device_communicators"
+barrier_path="$communicator_dir/host_barrier_pipeline_shim.so"
+barrier_tmp="$(mktemp "$communicator_dir/.host_barrier_pipeline.XXXXXX.so")"
+extension_build_dir="$(mktemp -d "$repo_dir/.native-helpers.XXXXXX")"
+trap 'rm -f "$helper_tmp" "$barrier_tmp"; rm -rf -- "$extension_build_dir"' EXIT
 
 "$cxx" -O3 -std=c++17 -shared -fPIC \
   "$repo_dir/csrc/cache/cuda_batch_copy_shim.cpp" \
@@ -78,8 +82,43 @@ trap 'rm -f "$helper_tmp"' EXIT
   -Wl,-l:libcudart.so.13 \
   -o "$helper_tmp"
 mv -f "$helper_tmp" "$helper_path"
+
+"$cxx" -O3 -std=c++17 -shared -fPIC \
+  "$repo_dir/csrc/host_all_reduce/host_barrier_pipeline_shim.cpp" \
+  -o "$barrier_tmp"
+mv -f "$barrier_tmp" "$barrier_path"
+
+mkdir -p \
+  "$extension_build_dir/mapped_host_tensor" \
+  "$extension_build_dir/mapped_host_tensor_typed"
+"$python_bin" - "$repo_dir" "$extension_build_dir" <<'PY'
+import sys
+from pathlib import Path
+
+from torch.utils.cpp_extension import load
+
+repo_dir = Path(sys.argv[1])
+build_dir = Path(sys.argv[2])
+source_dir = repo_dir / "csrc" / "host_all_reduce"
+
+for name in ("mapped_host_tensor_ext", "mapped_host_tensor_typed_ext"):
+    load(
+        name=name,
+        sources=[str(source_dir / f"{name}.cpp")],
+        extra_cflags=["-O3"],
+        build_directory=str(build_dir / name.removesuffix("_ext")),
+        verbose=False,
+    )
+PY
+mv -f \
+  "$extension_build_dir/mapped_host_tensor/mapped_host_tensor_ext.so" \
+  "$communicator_dir/mapped_host_tensor_ext.so"
+mv -f \
+  "$extension_build_dir/mapped_host_tensor_typed/mapped_host_tensor_typed_ext.so" \
+  "$helper_dir/mapped_host_tensor_typed_ext.so"
 trap - EXIT
+rm -rf -- "$extension_build_dir"
 
 echo
-echo "Installed vLLM MoE Experimental and its native expert-cache helper."
+echo "Installed vLLM MoE Experimental and its native cache/all-reduce helpers."
 echo "Activate it with: source $venv_dir/bin/activate"

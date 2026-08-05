@@ -646,6 +646,42 @@ class RoutedExperts(PluggableLayer):
                     expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
         return expert_data
 
+    def _tp_intermediate_shard_bounds(
+        self, checkpoint_extent: int, tp_rank: int
+    ) -> tuple[int, int]:
+        """Map this rank's logical MoE slice onto a packed checkpoint axis.
+
+        MXFP4 stores the same intermediate axis at several physical extents:
+        full width for w13, half width for packed w2, and 1/32 width for block
+        scales. Mapping proportional logical boundaries, rather than assuming
+        equal checkpoint chunks, handles all three without quant-format
+        special cases.
+        """
+        partition_sizes = self.moe_config.tp_intermediate_partition_sizes
+        if partition_sizes is None:
+            tp_size = self.moe_config.moe_parallel_config.tp_size
+            loaded_per_rank = checkpoint_extent // tp_size
+            return loaded_per_rank * tp_rank, loaded_per_rank
+
+        if not 0 <= tp_rank < len(partition_sizes):
+            raise ValueError(
+                f"Invalid TP rank {tp_rank} for uneven partitions {partition_sizes}."
+            )
+        logical_total = sum(partition_sizes)
+        logical_start = sum(partition_sizes[:tp_rank])
+        logical_end = logical_start + partition_sizes[tp_rank]
+        start_numerator = checkpoint_extent * logical_start
+        end_numerator = checkpoint_extent * logical_end
+        if start_numerator % logical_total != 0 or end_numerator % logical_total != 0:
+            raise ValueError(
+                "Uneven MoE TP partition boundary cannot be represented exactly "
+                f"on checkpoint extent {checkpoint_extent}: logical range "
+                f"[{logical_start}, {logical_end}) of {logical_total}."
+            )
+        start = start_numerator // logical_total
+        end = end_numerator // logical_total
+        return start, end - start
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -669,9 +705,9 @@ class RoutedExperts(PluggableLayer):
             # size.  Compute the offset into the checkpoint weight using
             # the *unpadded* per-rank size so that every TP rank lands at
             # the correct slice.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
+            start_offset, loaded_per_rank = self._tp_intermediate_shard_bounds(
+                loaded_weight.shape[shard_dim], tp_rank
+            )
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # If there is no available weight to load for this TP rank
@@ -711,9 +747,9 @@ class RoutedExperts(PluggableLayer):
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
+            start_offset, loaded_per_rank = self._tp_intermediate_shard_bounds(
+                loaded_weight.shape[shard_dim], tp_rank
+            )
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # If there is no available weight to load for this TP rank

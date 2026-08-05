@@ -79,12 +79,8 @@ def _read_marlin_moe_exec_config(prefix: str) -> dict[str, int]:
     }
 
 
-_MARLIN_MOE_GEMM1_EXEC_CONFIG = _read_marlin_moe_exec_config(
-    "VLLM_MARLIN_MOE_GEMM1"
-)
-_MARLIN_MOE_GEMM2_EXEC_CONFIG = _read_marlin_moe_exec_config(
-    "VLLM_MARLIN_MOE_GEMM2"
-)
+_MARLIN_MOE_GEMM1_EXEC_CONFIG = _read_marlin_moe_exec_config("VLLM_MARLIN_MOE_GEMM1")
+_MARLIN_MOE_GEMM2_EXEC_CONFIG = _read_marlin_moe_exec_config("VLLM_MARLIN_MOE_GEMM2")
 
 
 def _fused_marlin_moe(
@@ -791,9 +787,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         # workspace1 = (M * topk * max(2 * N, K),)
         # workspace2 = (M * topk, N)
 
-        # Workspace/IntermediateCache allocation accounting for output buffer
-        # provisioning
-        workspace1 = (M * topk, max(N, K))
+        # workspace1 holds cache2 [M * topk, N], then the non-overlapping final
+        # output [M, K]. Size it for the larger live view without applying
+        # topk to the output-only K dimension.
+        workspace1 = (M, max(topk * N, K))
         workspace2 = (M * topk * max(2 * N, K),)
         output = (M, K)
 
